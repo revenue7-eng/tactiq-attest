@@ -1,0 +1,18 @@
+[package]
+name = "prover"
+version = "0.1.0"
+edition.workspace = true
+description = "TactiQ attestation agent: produces the canonical envelope from a TPM"
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "tactiq-agent"
+path = "src/main.rs"
+
+[dependencies]
+# The only dependency, on purpose. It is the envelope crate, not attest-core:
+# the agent needs the wire format and nothing else, so it never links the
+# verifier, the trust store, or the durable high-water mark. Sharing this one
+# crate is what makes prover/verifier format drift impossible.
+attest-envelope = { path = "../attest-envelope" }
