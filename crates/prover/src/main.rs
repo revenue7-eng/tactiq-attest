@@ -204,7 +204,7 @@ fn cmd_attest(paths: &Paths, work: &Path, out_dir: &str, pcr_spec: &str) -> Resu
     let pcr_state = tpm::pcr_read(pcr_spec, work)?;
     let selection = encode_pcr_selection(DEFAULT_PCR_ALG, DEFAULT_PCR_BITMAP);
 
-    let msg = build_canonical(&id, counter, &selection, &pcr_state);
+    let msg = build_canonical(&id, counter, &selection, &pcr_state, &[]);
     if msg.len() != MSG_LEN {
         return Err(format!("built {} bytes, expected {MSG_LEN}", msg.len()));
     }
