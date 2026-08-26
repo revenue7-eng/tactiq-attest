@@ -34,10 +34,16 @@
 //! itself does not, so the signed message keeps a fixed width and this crate
 //! keeps its exact-length parser.
 //!
-//! This crate deliberately does not know what a bundle *is*. It commits to an
-//! opaque byte string and nothing more — the layout of that string, and the
-//! appraisal of its contents, belong to gate 3 in `verifier-rats` (§8 items
-//! 5/6). Binding is a wire-format concern; interpretation is not.
+//! Since decision 6 (§8 item 5) this crate also knows the bundle's *framing* —
+//! the tag/len section container defined below — but still not its *meaning*.
+//! Which tags a verifier requires, how tags map to evidence kinds, and how a
+//! section body is appraised belong to gate 3 in `verifier-rats` (§8 items
+//! 5/6). Binding and framing are wire-format concerns; interpretation is not.
+//!
+//! `evidence_digest` is taken over the framed bundle bytes exactly as
+//! transported. There is no canonical re-encoding: two bundles that differ in
+//! section order or in duplicate sections are different bundles with different
+//! digests, and that is intended (decision 6: no canonicalisation).
 //!
 //! There is no "no evidence" sentinel. A device with no sub-attesters has an
 //! empty bundle, and the digest of an empty bundle is a perfectly ordinary
@@ -202,6 +208,157 @@ pub fn build_canonical(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Evidence bundle container (DDR-002 decision 6, §8 item 5)
+// ---------------------------------------------------------------------------
+//
+// A bundle is a concatenation of sections, each:
+//
+//     tag (u16, big-endian) || len (u32, big-endian) || body (len bytes)
+//
+// Tag registry. The space is public and extensible by construction
+// (decision 6 boundary B): a tag unknown to a verifier parses fine and is
+// appraised as `EvidenceUnrecognized` downstream, never as a parse error.
+//
+//     0x0000            forbidden, never assigned
+//     0x0001            TPM quote
+//     0x0002            GPU attestation
+//     0x0003            CPU TEE report
+//     0x0004..=0xFEFF   unassigned, public registry
+//     0xFF00..=0xFFFE   private / experimental, never publicly registered
+//     0xFFFF            forbidden, never assigned
+//
+// The two forbidden values are load-bearing, not decoration. A zeroed buffer
+// would otherwise parse as `tag=0, len=0` — a legitimate-looking empty-ish
+// bundle — and an empty bundle IS legitimate (boundary A), so zero-fill would
+// pass silently. Erased NOR flash reads back 0xFF and is the same failure from
+// the other end. Both patterns must die in the parser, as container refusal
+// (boundary C), not arrive at appraisal.
+//
+// Duplicate tags are legal on the wire (two TPMs on one board is a real
+// configuration); collapsing them into a set is the verifier's mapping step,
+// not the codec's business.
+//
+// A section's claimed `len` is validated against the bytes actually remaining
+// BEFORE anything is read, and is never used as an allocation size — bodies
+// are subslices of the input, this parser allocates nothing per section.
+
+/// Fixed section header width: tag(2) + len(4).
+pub const SECTION_HEADER_LEN: usize = 6;
+
+/// Assigned tags. The `tag -> EvidenceKind` mapping lives in `verifier-rats`
+/// and uses these constants; the numeric values are wire format and live here.
+pub const TAG_TPM_QUOTE: u16 = 0x0001;
+pub const TAG_GPU_ATTEST: u16 = 0x0002;
+pub const TAG_CPU_TEE: u16 = 0x0003;
+/// Private/experimental range, inclusive. Never publicly registered.
+pub const TAG_PRIVATE_MIN: u16 = 0xFF00;
+pub const TAG_PRIVATE_MAX: u16 = 0xFFFE;
+
+/// 0x0000 (zeroed memory) and 0xFFFF (erased flash) are refused in the parser
+/// and in the builder, permanently.
+pub fn tag_forbidden(tag: u16) -> bool {
+    tag == 0x0000 || tag == 0xFFFF
+}
+
+/// One parsed section: the tag and its body, borrowed from the bundle bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Section<'a> {
+    pub tag: u16,
+    pub body: &'a [u8],
+}
+
+/// Iterator over the sections of a bundle. Yields `Err` once at the first
+/// malformation and then fuses: a bundle is either fully parseable or refused,
+/// there is no "the valid prefix" (boundary C).
+pub struct Sections<'a> {
+    rest: &'a [u8],
+    offset: usize,
+    failed: bool,
+}
+
+/// Iterate the sections of `bundle`. An empty bundle yields no sections and no
+/// error — the legitimate no-sub-attesters state (boundary A).
+pub fn sections(bundle: &[u8]) -> Sections<'_> {
+    Sections { rest: bundle, offset: 0, failed: false }
+}
+
+impl<'a> Iterator for Sections<'a> {
+    type Item = Result<Section<'a>, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed || self.rest.is_empty() {
+            return None;
+        }
+        if self.rest.len() < SECTION_HEADER_LEN {
+            self.failed = true;
+            return Some(Err(format!(
+                "truncated section header at offset {}: {} byte(s) left, want {}",
+                self.offset,
+                self.rest.len(),
+                SECTION_HEADER_LEN
+            )));
+        }
+        let tag = u16::from_be_bytes([self.rest[0], self.rest[1]]);
+        if tag_forbidden(tag) {
+            self.failed = true;
+            return Some(Err(format!(
+                "forbidden tag 0x{tag:04X} at offset {}",
+                self.offset
+            )));
+        }
+        let len =
+            u32::from_be_bytes([self.rest[2], self.rest[3], self.rest[4], self.rest[5]]) as usize;
+        let after_header = &self.rest[SECTION_HEADER_LEN..];
+        if len > after_header.len() {
+            self.failed = true;
+            return Some(Err(format!(
+                "section 0x{tag:04X} at offset {} claims {} byte(s), {} remain",
+                self.offset,
+                len,
+                after_header.len()
+            )));
+        }
+        let (body, rest) = after_header.split_at(len);
+        self.rest = rest;
+        self.offset += SECTION_HEADER_LEN + len;
+        Some(Ok(Section { tag, body }))
+    }
+}
+
+/// Parse a whole bundle atomically: all sections, or the first error and
+/// nothing. This is the verifier's entry point — a refused container must not
+/// degrade into `presented = []` (boundary C vs boundary A).
+pub fn parse_bundle(bundle: &[u8]) -> Result<Vec<Section<'_>>, String> {
+    let mut out = Vec::new();
+    for s in sections(bundle) {
+        out.push(s?);
+    }
+    Ok(out)
+}
+
+/// Build a bundle on the prover side. Rejects what the parser would refuse,
+/// so both sides agree by construction — same reason `build_canonical` takes
+/// digests itself.
+pub fn build_bundle(sections: &[(u16, &[u8])]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    for &(tag, body) in sections {
+        if tag_forbidden(tag) {
+            return Err(format!("forbidden tag 0x{tag:04X}"));
+        }
+        if body.len() > u32::MAX as usize {
+            return Err(format!(
+                "section 0x{tag:04X} body of {} bytes exceeds u32 length field",
+                body.len()
+            ));
+        }
+        out.extend_from_slice(&tag.to_be_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(body);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +410,120 @@ mod tests {
         let sel = sel_sha256_0_7();
         let m = build_canonical("device-A", 1, &sel, b"x", b"bundle");
         assert_eq!(&m[MSG_LEN - EVIDENCE_HASH_LEN..], &evidence_digest(b"bundle"));
+    }
+
+    // ---- bundle container (decision 6) ----
+
+    #[test]
+    fn bundle_roundtrip_preserves_order_and_bytes() {
+        let b = build_bundle(&[
+            (TAG_TPM_QUOTE, b"quote-bytes".as_slice()),
+            (TAG_GPU_ATTEST, b"".as_slice()),
+            (TAG_CPU_TEE, b"tee".as_slice()),
+        ])
+        .unwrap();
+        let s = parse_bundle(&b).unwrap();
+        assert_eq!(s.len(), 3);
+        assert_eq!((s[0].tag, s[0].body), (TAG_TPM_QUOTE, b"quote-bytes".as_slice()));
+        assert_eq!((s[1].tag, s[1].body), (TAG_GPU_ATTEST, b"".as_slice()));
+        assert_eq!((s[2].tag, s[2].body), (TAG_CPU_TEE, b"tee".as_slice()));
+    }
+
+    #[test]
+    fn empty_bundle_is_zero_sections_not_an_error() {
+        // Boundary A: the no-sub-attesters state is legitimate.
+        assert_eq!(parse_bundle(b"").unwrap(), vec![]);
+        assert_eq!(sections(b"").count(), 0);
+    }
+
+    #[test]
+    fn unknown_tags_parse_as_sections() {
+        // Boundary B: extensible by construction. Unknown-to-us is not
+        // malformed; public-unassigned and private ranges both parse.
+        let b = build_bundle(&[(0x0004, b"x".as_slice()), (TAG_PRIVATE_MIN, b"y".as_slice())]).unwrap();
+        let s = parse_bundle(&b).unwrap();
+        assert_eq!(s[0].tag, 0x0004);
+        assert_eq!(s[1].tag, TAG_PRIVATE_MIN);
+    }
+
+    #[test]
+    fn zeroed_buffer_is_container_refusal_not_empty_bundle() {
+        // tag 0x0000 forbidden: a zero-filled buffer must not parse as a
+        // pile of empty sections, because empty-ish is legitimate (boundary A)
+        // and zero-fill would otherwise pass silently.
+        assert!(parse_bundle(&[0u8; 6]).is_err());
+        assert!(parse_bundle(&[0u8; 60]).is_err());
+    }
+
+    #[test]
+    fn erased_flash_buffer_is_container_refusal() {
+        // tag 0xFFFF forbidden: erased NOR reads back 0xFF.
+        assert!(parse_bundle(&[0xFFu8; 6]).is_err());
+        assert!(parse_bundle(&[0xFFu8; 60]).is_err());
+    }
+
+    #[test]
+    fn truncation_is_refusal_of_the_whole_container() {
+        // Boundary C: refused container, not "the valid prefix".
+        let b = build_bundle(&[
+            (TAG_TPM_QUOTE, b"quote".as_slice()),
+            (TAG_CPU_TEE, b"tee".as_slice()),
+        ])
+        .unwrap();
+        assert!(parse_bundle(&b[..b.len() - 1]).is_err()); // body cut
+        assert!(parse_bundle(&b[..b.len() - 4]).is_err()); // header cut
+    }
+
+    #[test]
+    fn overlong_len_fails_against_remaining_bytes_before_any_read() {
+        // Boundary F: len is checked against what remains; it is never an
+        // allocation size. 0xFFFFFFFF on a tiny buffer must simply refuse.
+        let mut b = TAG_TPM_QUOTE.to_be_bytes().to_vec();
+        b.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        b.extend_from_slice(b"short");
+        let err = parse_bundle(&b).unwrap_err();
+        assert!(err.contains("4294967295"), "unexpected error text: {err}");
+    }
+
+    #[test]
+    fn duplicate_tags_are_legal_on_the_wire() {
+        // Boundary E: two TPMs on one board is a real configuration.
+        // Collapsing into a set is the verifier's mapping step, not the codec's.
+        let b = build_bundle(&[
+            (TAG_TPM_QUOTE, b"tpm-0".as_slice()),
+            (TAG_TPM_QUOTE, b"tpm-1".as_slice()),
+        ])
+        .unwrap();
+        let s = parse_bundle(&b).unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].tag, s[1].tag);
+        assert_ne!(s[0].body, s[1].body);
+    }
+
+    #[test]
+    fn builder_refuses_what_the_parser_refuses() {
+        assert!(build_bundle(&[(0x0000, b"".as_slice())]).is_err());
+        assert!(build_bundle(&[(0xFFFF, b"".as_slice())]).is_err());
+    }
+
+    #[test]
+    fn sections_iterator_fuses_after_first_error() {
+        // One error, then silence — no resynchronisation on garbage.
+        let mut b = build_bundle(&[(TAG_TPM_QUOTE, b"ok".as_slice())]).unwrap();
+        b.extend_from_slice(&[0x00, 0x00]); // forbidden tag, then nothing
+        let items: Vec<_> = sections(&b).collect();
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_ok());
+        assert!(items[1].is_err());
+    }
+
+    #[test]
+    fn digest_is_over_transported_bytes_no_canonicalisation() {
+        // Decision 6: no canonical re-encoding. Order matters, duplicates
+        // matter, the digest commits to the bytes as they rode.
+        let ab = build_bundle(&[(TAG_TPM_QUOTE, b"a".as_slice()), (TAG_CPU_TEE, b"b".as_slice())]).unwrap();
+        let ba = build_bundle(&[(TAG_CPU_TEE, b"b".as_slice()), (TAG_TPM_QUOTE, b"a".as_slice())]).unwrap();
+        assert_ne!(evidence_digest(&ab), evidence_digest(&ba));
     }
 
     #[test]
