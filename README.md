@@ -95,10 +95,12 @@ the verifier, since they need both sides.
 
 ## Status
 
-Alpha. Exercised against swtpm; not yet against a discrete TPM. Two properties
-stay unproven until it is: that the NV counter cannot be rolled back across a
-power cycle, and that the private key is genuinely non-exportable. A software
-TPM keeps its state in a file and cannot demonstrate either.
+Alpha. Exercised against a discrete TPM (Infineon SLB9670 over SPI) as well as
+swtpm. Two properties remain unproven and require a deliberate test: that the
+NV counter cannot be rolled back across a power cycle, and that the private key
+is genuinely non-exportable. Running on a discrete chip makes them testable,
+which a software TPM keeping its state in a file cannot; neither has been
+measured.
 
 ## License
 
