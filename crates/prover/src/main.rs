@@ -29,17 +29,20 @@ use std::time::{Duration, Instant};
 use attest_envelope::{build_canonical, encode_pcr_selection, MSG_LEN};
 use state::{Paths, Provisioning};
 
-/// SHA-256 over PCRs 0..7. Alg 0x000B is sha256; the bitmap is little-endian by
-/// PCR index (PCR n -> byte n/8, bit n%8), so 0..7 is `ff 00 00`.
+/// The PCR selection the prover attests, as a tpm2-tools selection string.
 ///
-/// This pair is not a constant of the protocol: `verifier-rats` compares the
-/// selection against the reference set's `expected_selection` before it compares
-/// the composite, so the selection is a property of the platform profile. It is
-/// a default here, overridable, and the value that ends up in the golden set is
-/// whatever the device actually sends at enrolment.
+/// This is the ONLY source of the selection: `tpm::pcr_read` hands this string
+/// to `tpm2_pcrread`, and `tpm::parse_pcr_spec` derives the envelope's
+/// (alg_id, bitmap) from the same string. Declared selection and attested
+/// contents therefore cannot diverge (tactiq-attest#1); there is no separate
+/// alg/bitmap constant to keep in sync.
+///
+/// It is not a constant of the protocol: `verifier-rats` compares the selection
+/// against the reference set's `expected_selection` before it compares the
+/// composite, so the selection is a property of the platform profile. It is a
+/// default here, overridable via TACTIQ_PCR_SPEC, and the value that ends up in
+/// the golden set is whatever the device actually sends at enrolment.
 const DEFAULT_PCR_SPEC: &str = "sha256:0,1,2,3,4,5,6,7";
-const DEFAULT_PCR_ALG: u16 = 0x000B;
-const DEFAULT_PCR_BITMAP: [u8; 3] = [0xff, 0x00, 0x00];
 
 const DEFAULT_KEYS_DIR: &str = "/data/tactiq/keys";
 const DEFAULT_OUT_DIR: &str = "/data/tactiq/audit";
@@ -195,6 +198,11 @@ fn cmd_attest(paths: &Paths, work: &Path, out_dir: &str, pcr_spec: &str) -> Resu
         }
     };
 
+    // Derive the declared selection from the same spec handed to tpm2_pcrread,
+    // and do it before touching the NV counter so a malformed spec cannot burn
+    // a counter value on every attempt.
+    let (alg_id, bitmap) = tpm::parse_pcr_spec(pcr_spec)?;
+
     // Order matters: advance the counter before measuring. If the process dies
     // after the increment, the burned value is simply never used — a gap in the
     // sequence is harmless because the verifier requires strictly-greater, not
@@ -202,7 +210,7 @@ fn cmd_attest(paths: &Paths, work: &Path, out_dir: &str, pcr_spec: &str) -> Resu
     // envelopes to describe different states under one counter value.
     let counter = tpm::nv_increment_and_read(work)?;
     let pcr_state = tpm::pcr_read(pcr_spec, work)?;
-    let selection = encode_pcr_selection(DEFAULT_PCR_ALG, DEFAULT_PCR_BITMAP);
+    let selection = encode_pcr_selection(alg_id, bitmap);
 
     let msg = build_canonical(&id, counter, &selection, &pcr_state, &[]);
     if msg.len() != MSG_LEN {
@@ -279,5 +287,20 @@ fn cmd_run(
         if elapsed < interval {
             std::thread::sleep(interval - elapsed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default selection must encode to the exact bytes the envelope has
+    /// always carried (sha256 = 0x000B, PCRs 0..7 = ff 00 00), so this fix
+    /// changes nothing on the wire for a default-configured device and a
+    /// verifier pinned to an earlier revision keeps matching.
+    #[test]
+    fn default_spec_encodes_to_historical_selection_bytes() {
+        let (alg_id, bitmap) = tpm::parse_pcr_spec(DEFAULT_PCR_SPEC).unwrap();
+        assert_eq!(encode_pcr_selection(alg_id, bitmap), [0x00, 0x0B, 0xff, 0x00, 0x00]);
     }
 }
