@@ -157,6 +157,64 @@ pub fn pcr_read(spec: &str, work: &Path) -> R<Vec<u8>> {
     std::fs::read(&f).map_err(|e| format!("read pcrs: {e}"))
 }
 
+/// Parse a tpm2-tools PCR selection string into the (alg_id, bitmap) pair the
+/// envelope encodes (`attest_envelope::encode_pcr_selection`).
+///
+/// This is the only place the declared selection is derived from, and it is
+/// derived from the very string `pcr_read` hands to `tpm2_pcrread`, so the
+/// declared selection and the attested contents cannot diverge
+/// (tactiq-attest#1). Agreement by construction, not by convention.
+///
+/// Fail-closed, each rule tested:
+///   * one bank only — the 5-byte selection cannot express a `+` multi-bank list;
+///   * a known algorithm (TCG alg ids);
+///   * PCR indices 0..=23 (a 3-byte bitmap covers exactly 24 PCRs);
+///   * strictly ascending, no duplicates — one set has one canonical spelling.
+pub fn parse_pcr_spec(spec: &str) -> R<(u16, [u8; 3])> {
+    if spec.contains('+') {
+        return Err(format!(
+            "pcr spec `{spec}`: multi-bank selection cannot be encoded in the envelope"
+        ));
+    }
+    let (alg, list) = spec
+        .split_once(':')
+        .ok_or_else(|| format!("pcr spec `{spec}`: expected `<alg>:<pcr,...>`"))?;
+    let alg_id: u16 = match alg.trim() {
+        "sha1" => 0x0004,
+        "sha256" => 0x000B,
+        "sha384" => 0x000C,
+        "sha512" => 0x000D,
+        other => return Err(format!("pcr spec `{spec}`: unknown algorithm `{other}`")),
+    };
+    let mut bitmap = [0u8; 3];
+    let mut last: Option<u8> = None;
+    for tok in list.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            return Err(format!("pcr spec `{spec}`: empty PCR index"));
+        }
+        let n: u8 = tok
+            .parse()
+            .map_err(|_| format!("pcr spec `{spec}`: bad PCR index `{tok}`"))?;
+        if n > 23 {
+            return Err(format!("pcr spec `{spec}`: PCR {n} out of range 0..=23"));
+        }
+        if let Some(p) = last {
+            if n <= p {
+                return Err(format!(
+                    "pcr spec `{spec}`: PCR indices must be strictly ascending (got {n} after {p})"
+                ));
+            }
+        }
+        bitmap[(n / 8) as usize] |= 1 << (n % 8);
+        last = Some(n);
+    }
+    if last.is_none() {
+        return Err(format!("pcr spec `{spec}`: no PCRs selected"));
+    }
+    Ok((alg_id, bitmap))
+}
+
 /// Sign the canonical envelope with the persisted attestation key.
 ///
 /// `-f plain` yields a bare r||s signature, which is what the verifier's
@@ -165,4 +223,59 @@ pub fn sign(msg: &Path, sig: &Path) -> R<()> {
     let (m, s) = (msg.to_string_lossy().to_string(), sig.to_string_lossy().to_string());
     run(&["tpm2_sign", "-c", KEY_HANDLE, "-g", "sha256", "-f", "plain", "-o", &s, &m])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pcr_spec;
+
+    #[test]
+    fn default_bank_and_pcrs_0_7() {
+        assert_eq!(parse_pcr_spec("sha256:0,1,2,3,4,5,6,7").unwrap(), (0x000B, [0xff, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn algorithm_ids_follow_tcg_registry() {
+        assert_eq!(parse_pcr_spec("sha1:0").unwrap().0, 0x0004);
+        assert_eq!(parse_pcr_spec("sha384:0").unwrap().0, 0x000C);
+        assert_eq!(parse_pcr_spec("sha512:0").unwrap().0, 0x000D);
+    }
+
+    #[test]
+    fn bitmap_is_tpm_bit_order_across_all_three_bytes() {
+        // PCR n -> byte n/8, bit n%8
+        assert_eq!(parse_pcr_spec("sha256:8,15").unwrap().1, [0x00, 0x81, 0x00]);
+        assert_eq!(parse_pcr_spec("sha256:16,23").unwrap().1, [0x00, 0x00, 0x81]);
+        assert_eq!(parse_pcr_spec("sha256:0,23").unwrap().1, [0x01, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn rejects_out_of_range_pcr() {
+        assert!(parse_pcr_spec("sha256:24").is_err());
+        assert!(parse_pcr_spec("sha256:0,99").is_err());
+    }
+
+    #[test]
+    fn rejects_multi_bank_because_envelope_cannot_encode_it() {
+        assert!(parse_pcr_spec("sha1:0,1+sha256:0,1").is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_algorithm_and_missing_bank() {
+        assert!(parse_pcr_spec("md5:0").is_err());
+        assert!(parse_pcr_spec("0,1,2").is_err());
+    }
+
+    #[test]
+    fn rejects_duplicates_and_non_ascending_for_one_canonical_spelling() {
+        assert!(parse_pcr_spec("sha256:0,0").is_err());
+        assert!(parse_pcr_spec("sha256:1,0").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_selection_and_empty_index() {
+        assert!(parse_pcr_spec("sha256:").is_err());
+        assert!(parse_pcr_spec("sha256:0,,1").is_err());
+        assert!(parse_pcr_spec("sha256:0,").is_err());
+    }
 }
