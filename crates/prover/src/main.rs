@@ -2,7 +2,7 @@
 //!
 //! Produces the canonical envelope that `attest-core` verifies:
 //!
-//!     device_id(16) || counter_be(8) || pcr_selection(5) || pcr_hash(32)   = 61 bytes
+//!     device_id(16) || counter_be(8) || pcr_selection(5) || pcr_hash(32) || evidence_hash(32) = 93 bytes
 //!
 //! The envelope is built by `attest-core::build_canonical`, not by this crate.
 //! That is the point of depending on it: prover and verifier share one codec, so
