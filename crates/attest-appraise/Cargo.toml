@@ -1,0 +1,27 @@
+[package]
+name = "attest-appraise"
+version = "0.1.0"
+edition.workspace = true
+description = "Single-envelope check: gate 1 (signature, evidence binding) and gate 3 (device-state appraisal) over the attest-envelope wire format"
+publish = false
+license.workspace = true
+
+[lib]
+name = "attest_appraise"
+path = "src/lib.rs"
+
+# Stateless by design (DDR-003, decision 7): no clock, no filesystem, no network,
+# no randomness. Whether an envelope is the device's latest is not judged here.
+#
+# p256 without default features: `default -> std -> elliptic-curve/std ->
+# rand_core/std -> getrandom`, and getrandom does not build for
+# wasm32-unknown-unknown. Verification needs no randomness. Keep it this way;
+# the wasm32 build in CI is what holds the rule.
+[dependencies]
+attest-envelope = { path = "../attest-envelope" }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+
+[dev-dependencies]
+# Tests sign real ECDSA P-256; dev-dependency features do not reach the library
+# build (resolver 2), so the wasm32 rule above is unaffected.
+p256 = { version = "0.13", features = ["ecdsa"] }
