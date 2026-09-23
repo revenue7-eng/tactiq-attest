@@ -239,3 +239,114 @@ fn verdict_chain_stays_copy() {
     assert_copy::<Verdict>();
     assert_copy::<Gate1Reject>();
 }
+
+// ---- reference set from a RIM (tactiq-rim/1) ----
+
+fn d(tag: u8) -> [u8; 32] { [tag; 32] }
+fn hx(b: &[u8; 32]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+
+/// A RIM over PCR 0..=9: PCR 1 per slot (A, B), PCR 4 with two admitted values,
+/// the rest one value each.
+fn rim_json() -> String {
+    let mut vals = Vec::new();
+    for i in 0..10u8 {
+        let v = match i {
+            1 => format!("{{\"A\":\"{}\",\"B\":\"{}\"}}", hx(&d(0xA1)), hx(&d(0xB1))),
+            4 => format!("[\"{}\",\"{}\"]", hx(&d(0x40)), hx(&d(0x41))),
+            _ => format!("[\"{}\"]", hx(&d(i))),
+        };
+        vals.push(format!("\"{i}\":{v}"));
+    }
+    format!("{{\"format\":\"tactiq-rim/1\",\"pcr\":{{\"bank\":\"sha256\",\
+             \"selection\":[0,1,2,3,4,5,6,7,8,9],\"values\":{{{}}}}}}}", vals.join(","))
+}
+
+/// The bytes `tpm2_pcrread sha256:0,...,9 -o` would write for the given slot
+/// value of PCR 1 and value of PCR 4.
+fn pcr_state(pcr1: u8, pcr4: u8) -> Vec<u8> {
+    (0..10u8)
+        .flat_map(|i| d(match i { 1 => pcr1, 4 => pcr4, _ => i }))
+        .collect()
+}
+
+fn sel_0_9() -> PcrSelection { PcrSelection { hash_alg: 0x000B, pcr_mask: [0xFF, 0x03, 0] } }
+
+fn check_state(state: &[u8], refs: &ReferenceSet) -> Verdict {
+    let (m, s) = envelope(&sel_0_9(), state, b"");
+    check(&m, &s, b"", &vk(), refs)
+}
+
+#[test]
+fn rim_selection_is_0_to_9_in_sha256() {
+    let r = reference_from_rim(&rim_json()).unwrap();
+    assert_eq!(r.expected_selection, sel_0_9());
+}
+
+#[test]
+fn rim_composites_are_per_slot_times_the_product_of_lists() {
+    // 2 slots x (PCR 4 has 2 values) = 4 composites.
+    assert_eq!(reference_from_rim(&rim_json()).unwrap().allowed.len(), 4);
+}
+
+#[test]
+fn rim_accepts_every_legitimate_combination_end_to_end() {
+    let r = reference_from_rim(&rim_json()).unwrap();
+    for (p1, p4) in [(0xA1, 0x40), (0xA1, 0x41), (0xB1, 0x40), (0xB1, 0x41)] {
+        assert_eq!(check_state(&pcr_state(p1, p4), &r), Verdict::accept(), "slot {p1:#x} pcr4 {p4:#x}");
+    }
+}
+
+#[test]
+fn rim_rejects_a_value_outside_the_sets() {
+    let r = reference_from_rim(&rim_json()).unwrap();
+    assert_eq!(check_state(&pcr_state(0xA1, 0x42), &r), Verdict::reject(Reason::UnrecognizedState));
+}
+
+#[test]
+fn rim_rejects_envelope_over_the_old_0_to_7_selection() {
+    // The agent's built-in default before tactiq-os#197.
+    let r = reference_from_rim(&rim_json()).unwrap();
+    let state: Vec<u8> = pcr_state(0xA1, 0x40)[..8 * 32].to_vec();
+    let (m, s) = envelope(&sel_0_7(), &state, b"");
+    assert_eq!(check(&m, &s, b"", &vk(), &r), Verdict::reject(Reason::UnrecognizedState));
+}
+
+#[test]
+fn rim_refuses_what_it_does_not_understand() {
+    let good = rim_json();
+    let cases = [
+        (good.replace("tactiq-rim/1", "tactiq-rim/2"), "format"),
+        (good.replace("\"bank\":\"sha256\"", "\"bank\":\"sha1\""), "bank"),
+        (good.replace("[0,1,2,3,4,5,6,7,8,9]", "[0,1,2,3,4,5,6,7,8]"), "selection"),
+        (good.replace(&hx(&d(0x03)), "zz"), "not 64 hex digits"),
+        (good.replace("[\"0000", "[\"00"), "not 64 hex digits"),
+        ("not json".to_string(), "not JSON"),
+    ];
+    for (rim, needle) in cases {
+        let e = reference_from_rim(&rim).err().unwrap_or_default();
+        assert!(e.contains(needle), "want {needle:?}, got {e:?}");
+    }
+}
+
+#[test]
+fn rim_refuses_slot_keyed_pcrs_that_disagree_on_slots() {
+    let rim = rim_json().replace(
+        &format!("[\"{}\"]", hx(&d(0x09))),
+        &format!("{{\"A\":\"{}\"}}", hx(&d(0x09))),
+    );
+    let e = reference_from_rim(&rim).err().unwrap_or_default();
+    assert!(e.contains("another PCR names"), "{e}");
+}
+
+/// Against a real RIM: `RIM_FILE=/path/rim-rock5a.json cargo test -p attest-appraise -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn rim_file_from_env() {
+    let path = std::env::var("RIM_FILE").expect("set RIM_FILE");
+    let r = reference_from_rim(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    println!("selection alg={:#06x} mask={:02x?}", r.expected_selection.hash_alg, r.expected_selection.pcr_mask);
+    println!("{} composite(s):", r.allowed.len());
+    for c in &r.allowed {
+        println!("  {}", hx(c));
+    }
+}
