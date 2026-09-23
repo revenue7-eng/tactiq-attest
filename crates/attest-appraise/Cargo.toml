@@ -20,6 +20,10 @@ path = "src/lib.rs"
 [dependencies]
 attest-envelope = { path = "../attest-envelope" }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+# Reading a RIM (tactiq-rim/1): JSON values only, no derive macros; SHA-256 for
+# the composites. Both build for wasm32-unknown-unknown.
+serde_json = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 # Tests sign real ECDSA P-256; dev-dependency features do not reach the library
