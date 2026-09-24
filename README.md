@@ -7,11 +7,19 @@ agent that produces it from a TPM.
 device_id(16) || counter_be(8) || pcr_selection(5) || pcr_hash(32) || evidence_hash(32)  = 93 bytes
 ```
 
-Signed with ECDSA P-256 inside the TPM. Freshness comes from a TPM NV monotonic
-counter, not from a server nonce, a clock, or a network round trip, which is
-what lets a device attest after months offline.
+The TPM quotes the selected PCRs with a restricted ECDSA P-256 attestation key
+(AK), and the quote's qualifying data is SHA-256 of this message. The verifier
+checks the AK signature over the quote, then that the quote commits to the
+message and that the TPM's own PCR digest equals `pcr_hash`. Each cycle writes
+`<stem>.msg`, `<stem>.attest` (the quote) and `<stem>.sig` (over `.attest`).
+The verifier trusts the AK by its public area; binding that AK to the TPM's
+endorsement key is a separate step and not part of this format.
 
-The signed message is a fixed 93 bytes and stays 93 bytes however much evidence
+Freshness comes from a TPM NV monotonic counter, not from a server nonce, a
+clock, or a network round trip, which is what lets a device attest after
+months offline.
+
+The message is a fixed 93 bytes and stays 93 bytes however much evidence
 the device collected, because what rides in it is a digest of the evidence
 bundle rather than the bundle. The parser enforces that length exactly, not as
 a minimum.

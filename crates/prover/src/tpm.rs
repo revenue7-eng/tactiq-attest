@@ -21,8 +21,10 @@ use std::process::Command;
 
 /// Owner-hierarchy persistent handle for the primary (parent) key.
 pub const PARENT_HANDLE: &str = "0x81010001";
-/// Owner-hierarchy persistent handle for the attestation signing key.
-pub const KEY_HANDLE: &str = "0x81010002";
+/// Owner-hierarchy persistent handle for the attestation key (AK), envelope v2
+/// (DDR-004 decision 7). `0x81010002` held the v1 signing key; it is left in
+/// place on TPMs that have it and never used again.
+pub const AK_HANDLE: &str = "0x81010003";
 /// NV index holding the monotonic counter that provides freshness.
 pub const NV_COUNTER: &str = "0x1500016";
 
@@ -70,45 +72,57 @@ pub fn create_primary(work: &Path) -> R<()> {
     Ok(())
 }
 
-/// Create the ECDSA P-256 attestation key under the primary and persist it.
+/// Create the ECDSA P-256 attestation key (AK) under the primary and persist it.
 ///
-/// The key is restricted to the TPM (`tpm2_create` never emits the private
-/// part in the clear) but is deliberately NOT sealed to a PCR policy.
+/// Restricted signing key (DDR-004 decision 7): the TPM will sign with it only
+/// structures it produced itself (a quote) or data it hashed and ticketed, and
+/// refuses external data that imitates a TPM structure. That refusal is what
+/// makes a quote evidence of measured state rather than of whatever the
+/// prover assembled. The `:null` in the algorithm is required: without it
+/// tpm2-tools gives a restricted key a symmetric scheme and the TPM refuses the
+/// create (`TPM_RC_SYMMETRIC`).
 ///
-/// Sealing would mean a device in an un-enrolled state could not sign at all.
-/// The verifier would then observe silence rather than a signed attestation of
-/// a state it does not recognise — and `verifier-rats` distinguishes
-/// `UnrecognizedState` (device honestly attested something not in the golden
-/// set) from `SignatureFail` (forgery) precisely so the consumer can quarantine
-/// in one case and alarm in the other. A PCR-sealed signing key collapses that
-/// distinction, and also makes a compromised device indistinguishable from one
-/// that is merely powered off.
-pub fn create_signing_key(work: &Path) -> R<()> {
-    let pubf = work.join("key.pub");
-    let privf = work.join("key.priv");
-    let ctx = work.join("key.ctx");
+/// The key is deliberately NOT sealed to a PCR policy.
+///
+/// Sealing would mean a device in an un-enrolled state could not attest at
+/// all. The verifier would then observe silence rather than a signed
+/// attestation of a state it does not recognise, and `verifier-rats`
+/// distinguishes `UnrecognizedState` (device honestly attested something not in
+/// the golden set) from `SignatureFail` (forgery) precisely so the consumer can
+/// quarantine in one case and alarm in the other. A PCR-sealed key collapses
+/// that distinction, and also makes a compromised device indistinguishable from
+/// one that is merely powered off. A quote keeps the distinction: it signs the
+/// current PCRs whatever they are.
+pub fn create_ak(work: &Path) -> R<()> {
+    let pubf = work.join("ak.pub");
+    let privf = work.join("ak.priv");
+    let ctx = work.join("ak.ctx");
     let (pubf, privf, ctx) = (
         pubf.to_string_lossy().to_string(),
         privf.to_string_lossy().to_string(),
         ctx.to_string_lossy().to_string(),
     );
     run(&[
-        "tpm2_create", "-C", PARENT_HANDLE, "-G", "ecc256:ecdsa-sha256",
+        "tpm2_create", "-C", PARENT_HANDLE, "-G", "ecc256:ecdsa-sha256:null",
+        "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign",
         "-u", &pubf, "-r", &privf,
     ])?;
+    let _ = run(&["tpm2_flushcontext", "-t"]);
     run(&["tpm2_load", "-C", PARENT_HANDLE, "-u", &pubf, "-r", &privf, "-c", &ctx])?;
-    // Persisting the key means the signing path needs no transient load per
+    // Persisting the key means the quote path needs no transient load per
     // cycle: one TPM object, reused for the life of the device.
-    run(&["tpm2_evictcontrol", "-C", "o", "-c", &ctx, KEY_HANDLE])?;
+    run(&["tpm2_evictcontrol", "-C", "o", "-c", &ctx, AK_HANDLE])?;
     let _ = run(&["tpm2_flushcontext", "-t"]);
     Ok(())
 }
 
-/// Read the persisted attestation key's public part as SubjectPublicKeyInfo PEM.
-/// This is what the verifier loads into its trust store; it replaces a CA.
-pub fn read_public_pem(out: &Path) -> R<()> {
+/// Write the persisted AK's public area as `TPM2B_PUBLIC`, the form the
+/// verifier's `AkKey::from_tpm2b_public` accepts. Not a PEM on purpose: the
+/// verifier derives "this is an AK" from the attributes in this structure, and
+/// a PEM would drop them.
+pub fn read_ak_public(out: &Path) -> R<()> {
     let out = out.to_string_lossy().to_string();
-    run(&["tpm2_readpublic", "-c", KEY_HANDLE, "-f", "pem", "-o", &out])?;
+    run(&["tpm2_readpublic", "-c", AK_HANDLE, "-o", &out])?;
     Ok(())
 }
 
@@ -215,13 +229,22 @@ pub fn parse_pcr_spec(spec: &str) -> R<(u16, [u8; 3])> {
     Ok((alg_id, bitmap))
 }
 
-/// Sign the canonical envelope with the persisted attestation key.
+/// Quote the selected PCRs with the AK, committing to the canonical message.
 ///
-/// `-f plain` yields a bare r||s signature, which is what the verifier's
-/// P-256 path expects; `-g sha256` matches the key's signing scheme.
-pub fn sign(msg: &Path, sig: &Path) -> R<()> {
-    let (m, s) = (msg.to_string_lossy().to_string(), sig.to_string_lossy().to_string());
-    run(&["tpm2_sign", "-c", KEY_HANDLE, "-g", "sha256", "-f", "plain", "-o", &s, &m])?;
+/// `qualifyingData = SHA-256(msg)` (`attest_envelope::tpm::qualifying_data`),
+/// so the TPM-signed `TPMS_ATTEST` binds the message and, through it, the
+/// counter and the evidence digest. `spec` must be the same string the PCRs
+/// were read with; the verifier refuses a quote whose selection or digest
+/// differs from the message. `-f plain` keeps the signature format the v1
+/// path used (the verifier accepts DER or r||s).
+pub fn quote(msg: &[u8], spec: &str, attest: &Path, sig: &Path) -> R<()> {
+    let qd = attest_envelope::tpm::qualifying_data(msg)?;
+    let hex: String = qd.iter().map(|b| format!("{b:02x}")).collect();
+    let (a, s) = (attest.to_string_lossy().to_string(), sig.to_string_lossy().to_string());
+    run(&[
+        "tpm2_quote", "-c", AK_HANDLE, "-l", spec, "-q", &hex,
+        "-m", &a, "-s", &s, "-g", "sha256", "-f", "plain",
+    ])?;
     Ok(())
 }
 
