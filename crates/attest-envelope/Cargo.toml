@@ -1,6 +1,6 @@
 [package]
 name = "attest-envelope"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 description = "Canonical Custinel attestation envelope: wire format shared by prover and verifier"
 publish = false
