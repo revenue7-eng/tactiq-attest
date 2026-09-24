@@ -52,6 +52,8 @@
 
 use sha2::{Digest, Sha256};
 
+pub mod tpm;
+
 pub const DEVICE_ID_LEN: usize = 16;
 pub const PCR_HASH_LEN: usize = 32;
 pub const COUNTER_LEN: usize = 8;
