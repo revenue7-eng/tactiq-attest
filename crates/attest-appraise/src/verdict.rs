@@ -42,6 +42,12 @@ pub enum Reason {
     /// gate-1 class: the envelope signature verified, but the bundle that rode
     /// alongside it is not the one that was signed over.
     EvidenceBindingFail,
+    /// v2 (DDR-004 decision 9): the quote verified under the AK but does not
+    /// commit to this message, or the envelope form does not match the trust
+    /// entry (a v1 envelope for an AK, a quote under a legacy key). Distinct
+    /// from `EvidenceBindingFail`: that one is about the bundle, this one about
+    /// the quote. Amends the vocabulary of DDR-001 decision 3.
+    QuoteBindingFail,
 
     // ---- classes produced by other verifiers, never by this crate ----
     /// the envelope is not the device's latest.

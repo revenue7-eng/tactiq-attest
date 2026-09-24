@@ -18,7 +18,10 @@ mod verdict;
 
 pub use appraisal::{appraise, check};
 pub use evidence::EvidenceKind;
-pub use gate1::{authenticate, Authenticated, Gate1Error, Gate1Reject};
+pub use gate1::{
+    authenticate, authenticate_envelope, AkKey, Authenticated, Binding, Gate1Error, Gate1Reject, QuoteMeta,
+    TrustEntry,
+};
 pub use reference::{AttestedState, PcrHash, PcrSelection, ReferenceSet};
 pub use rim::reference_from_rim;
 pub use verdict::{Outcome, Reason, Verdict};
