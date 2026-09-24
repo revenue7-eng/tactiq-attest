@@ -13,8 +13,12 @@
 //! unlikely.
 //!
 //! Commands
-//!   provision   first boot: create key, define counter, assign identity
-//!   attest      one cycle: advance counter, measure, build envelope, sign
+//!   provision   first boot: create AK, define counter, assign identity
+//!   attest      one cycle: advance counter, measure, build envelope, quote
+//!
+//! Envelope v2 (DDR-004): `<stem>.msg` is the 93-byte message above,
+//! `<stem>.attest` the `TPMS_ATTEST` of a TPM quote whose qualifying data is
+//! SHA-256 of the message, `<stem>.sig` the AK signature over `.attest`.
 //!   run         attest on an interval, feeding the systemd watchdog
 //!
 //! Everything TPM-facing is in `tpm.rs`; everything disk-facing is in `state.rs`.
@@ -159,8 +163,8 @@ fn cmd_provision(paths: &Paths, work: &Path, id: &str) -> Result<(), String> {
     if !tpm::handle_exists(tpm::PARENT_HANDLE) {
         tpm::create_primary(work)?;
     }
-    if !tpm::handle_exists(tpm::KEY_HANDLE) {
-        tpm::create_signing_key(work)?;
+    if !tpm::handle_exists(tpm::AK_HANDLE) {
+        tpm::create_ak(work)?;
     }
     if !tpm::nv_defined(tpm::NV_COUNTER) {
         tpm::nv_define()?;
@@ -171,14 +175,14 @@ fn cmd_provision(paths: &Paths, work: &Path, id: &str) -> Result<(), String> {
     // reverse order would leave an id with no key, which looks the same from
     // outside but is harder to reason about: the id may already have been
     // handed to the verifier.
-    tpm::read_public_pem(&paths.pubkey())?;
+    tpm::read_ak_public(&paths.pubkey())?;
     state::finalize_pubkey_perms(paths)?;
     state::sync_dir(&paths.keys_dir)?;
     state::write_id(paths, id)?;
 
     println!("provisioned {id}");
     println!("  public key: {}", paths.pubkey().display());
-    println!("  give that file to the verifier as trust/{id}.pem");
+    println!("  AK public area (TPM2B_PUBLIC); give it to the verifier as trust/{id}.pub");
     Ok(())
 }
 
@@ -219,9 +223,10 @@ fn cmd_attest(paths: &Paths, work: &Path, out_dir: &str, pcr_spec: &str) -> Resu
 
     let stem = format!("{counter:012}");
     let msg_path = out.join(format!("{stem}.msg"));
+    let attest_path = out.join(format!("{stem}.attest"));
     let sig_path = out.join(format!("{stem}.sig"));
     fs::write(&msg_path, &msg).map_err(|e| format!("write {}: {e}", msg_path.display()))?;
-    tpm::sign(&msg_path, &sig_path)?;
+    tpm::quote(&msg, pcr_spec, &attest_path, &sig_path)?;
     // The tag file is what `custinel-verify` reads to decide the expected
     // disposition; a real emission always expects Accept.
     fs::write(out.join(format!("{stem}.tag")), format!("{id} counter={counter}\n"))

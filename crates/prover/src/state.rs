@@ -44,7 +44,7 @@ impl Paths {
         Self { keys_dir: keys_dir.into() }
     }
     pub fn device_id(&self) -> PathBuf { self.keys_dir.join("device_id") }
-    pub fn pubkey(&self) -> PathBuf { self.keys_dir.join("pubkey.pem") }
+    pub fn pubkey(&self) -> PathBuf { self.keys_dir.join("ak.pub") }
 }
 
 #[derive(Debug, PartialEq, Eq)]
