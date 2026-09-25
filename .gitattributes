@@ -2,3 +2,8 @@
 # Some contain 0x0a and no NUL, so git would guess "text" and an
 # autocrlf checkout would rewrite them, breaking real TPM signatures.
 crates/attest-appraise/tests/fixtures/** binary
+# Registrar fixtures: certificates, a key, TPM names and credential blobs.
+tools/registrar/tests/fixtures/**/*.der binary
+tools/registrar/tests/fixtures/**/*.pk8 binary
+tools/registrar/tests/fixtures/**/*.bin binary
+tools/registrar/tests/fixtures/**/*.blob binary
