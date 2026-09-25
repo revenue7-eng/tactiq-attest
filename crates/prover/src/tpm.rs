@@ -19,12 +19,20 @@
 use std::path::Path;
 use std::process::Command;
 
-/// Owner-hierarchy persistent handle for the primary (parent) key.
-pub const PARENT_HANDLE: &str = "0x81010001";
-/// Owner-hierarchy persistent handle for the attestation key (AK), envelope v2
-/// (DDR-004 decision 7). `0x81010002` held the v1 signing key; it is left in
-/// place on TPMs that have it and never used again.
-pub const AK_HANDLE: &str = "0x81010003";
+/// Persistent handle of the attestation key (AK), DDR-005 decision 4.
+///
+/// The AK is a non-primary key in the endorsement hierarchy, so it sits above
+/// the first 256 handles of the endorsement range, which the TCG registry keeps
+/// for primaries such as the EK. Earlier agents persisted their own objects at
+/// `0x81010001` (owner primary), `0x81010002` (v1 key) and `0x81010003` (v2 AK
+/// under that primary); the first two are EK handles by convention. This agent
+/// never reads, writes or evicts any of the three. Removing them from a device
+/// is a separate, announced step.
+///
+/// A handle is never trusted by occupancy: every use of the object here is
+/// preceded by `verify_ak`, which compares its name with the one recorded at
+/// provisioning.
+pub const AK_HANDLE: &str = "0x81010100";
 /// NV index holding the monotonic counter that provides freshness.
 pub const NV_COUNTER: &str = "0x1500016";
 
@@ -46,41 +54,62 @@ fn run(args: &[&str]) -> R<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// True when the handle is already occupied in the owner hierarchy.
-pub fn handle_exists(handle: &str) -> bool {
-    match run(&["tpm2_getcap", "handles-persistent"]) {
-        Ok(o) => String::from_utf8_lossy(&o).contains(handle),
-        Err(_) => false,
-    }
+/// True when `handle` appears in a `tpm2_getcap handles-*` listing.
+///
+/// Exact match per line (`- 0x81010100`), case-insensitive, not a substring
+/// search over the whole output.
+fn listing_has(listing: &str, handle: &str) -> bool {
+    listing
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .any(|h| h.trim().eq_ignore_ascii_case(handle))
 }
 
-/// True when the NV counter index is already defined.
-pub fn nv_defined(index: &str) -> bool {
-    match run(&["tpm2_getcap", "handles-nv-index"]) {
-        Ok(o) => String::from_utf8_lossy(&o).contains(index),
-        Err(_) => false,
-    }
+/// Whether the persistent handle is occupied. A failed `tpm2_getcap` is an
+/// error, not "free": the caller decides on an answer it can trust.
+pub fn handle_exists(handle: &str) -> R<bool> {
+    let o = run(&["tpm2_getcap", "handles-persistent"])?;
+    Ok(listing_has(&String::from_utf8_lossy(&o), handle))
 }
 
-/// Create the primary key and persist it at `PARENT_HANDLE`.
-pub fn create_primary(work: &Path) -> R<()> {
-    let ctx = work.join("primary.ctx");
-    let ctx = ctx.to_string_lossy().to_string();
-    run(&["tpm2_createprimary", "-C", "o", "-g", "sha256", "-G", "ecc", "-c", &ctx])?;
-    run(&["tpm2_evictcontrol", "-C", "o", "-c", &ctx, PARENT_HANDLE])?;
+/// Whether the NV counter index is defined. Errors as `handle_exists`.
+pub fn nv_defined(index: &str) -> R<bool> {
+    let o = run(&["tpm2_getcap", "handles-nv-index"])?;
+    Ok(listing_has(&String::from_utf8_lossy(&o), index))
+}
+
+/// Recreate the RSA-2048 EK from the default TCG template into a transient
+/// context file (DDR-005 decision 2). It is never persisted.
+///
+/// Assumes the endorsement hierarchy has an empty authorization, as on the
+/// bench. A device whose endorsement auth is set needs it passed here and in
+/// the policy session of activation; that is an assumption to record for the
+/// release image, not something this function detects.
+fn create_ek(work: &Path) -> R<String> {
+    let ctx = work.join("ek.ctx").to_string_lossy().to_string();
+    let pubf = work.join("ek.pub").to_string_lossy().to_string();
+    run(&["tpm2_createek", "-c", &ctx, "-G", "rsa", "-u", &pubf])?;
     let _ = run(&["tpm2_flushcontext", "-t"]);
-    Ok(())
+    Ok(ctx)
 }
 
-/// Create the ECDSA P-256 attestation key (AK) under the primary and persist it.
+/// Create the ECDSA P-256 attestation key (AK) under the EK, in the
+/// endorsement hierarchy (DDR-005 decision 3), and persist it at `AK_HANDLE`.
+///
+/// The caller must have checked that `AK_HANDLE` is free.
+///
+/// In the endorsement hierarchy the quote carries `resetCount`,
+/// `restartCount` and `firmwareVersion` in the clear; under an owner parent
+/// the TPM obfuscates them (DDR-004 boundary D).
 ///
 /// Restricted signing key (DDR-004 decision 7): the TPM will sign with it only
 /// structures it produced itself (a quote) or data it hashed and ticketed, and
 /// refuses external data that imitates a TPM structure. That refusal is what
 /// makes a quote evidence of measured state rather than of whatever the
-/// prover assembled. The `:null` in the algorithm is required: without it
-/// tpm2-tools gives a restricted key a symmetric scheme and the TPM refuses the
-/// create (`TPM_RC_SYMMETRIC`).
+/// prover assembled. `tpm2_createak` sets the attributes of DDR-004 decision 7
+/// and the null symmetric scheme itself (DDR-005 Verification); the registrar
+/// checks the result against the DDR-004 decision 4 rule, so a tool version
+/// that created something else is caught there, not trusted here.
 ///
 /// The key is deliberately NOT sealed to a PCR policy.
 ///
@@ -102,13 +131,14 @@ pub fn create_ak(work: &Path) -> R<()> {
         privf.to_string_lossy().to_string(),
         ctx.to_string_lossy().to_string(),
     );
+    let ek = create_ek(work)?;
+    // Loading a child of the EK needs the EK's policy (PolicySecret on the
+    // endorsement hierarchy); tpm2_createak runs that session itself.
     run(&[
-        "tpm2_create", "-C", PARENT_HANDLE, "-G", "ecc256:ecdsa-sha256:null",
-        "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign",
+        "tpm2_createak", "-C", &ek, "-c", &ctx, "-G", "ecc", "-g", "sha256", "-s", "ecdsa",
         "-u", &pubf, "-r", &privf,
     ])?;
     let _ = run(&["tpm2_flushcontext", "-t"]);
-    run(&["tpm2_load", "-C", PARENT_HANDLE, "-u", &pubf, "-r", &privf, "-c", &ctx])?;
     // Persisting the key means the quote path needs no transient load per
     // cycle: one TPM object, reused for the life of the device.
     run(&["tpm2_evictcontrol", "-C", "o", "-c", &ctx, AK_HANDLE])?;
@@ -124,6 +154,47 @@ pub fn read_ak_public(out: &Path) -> R<()> {
     let out = out.to_string_lossy().to_string();
     run(&["tpm2_readpublic", "-c", AK_HANDLE, "-o", &out])?;
     Ok(())
+}
+
+/// Compare two `TPM2B_PUBLIC` areas by TPM name. `recorded` is the public area
+/// written at provisioning, `at_handle` the one the TPM reports now.
+///
+/// Both are parsed (an ECC key with a sha256 name), and the names are computed
+/// here rather than taken from tool output.
+pub fn same_ak(recorded: &[u8], at_handle: &[u8]) -> R<()> {
+    use attest_envelope::tpm::EccPublic;
+    let r = EccPublic::parse_tpm2b(recorded)
+        .and_then(|p| p.name())
+        .map_err(|e| format!("recorded AK public area unusable ({e}); \
+                  it was not written by this agent version, re-provision deliberately"))?;
+    let h = EccPublic::parse_tpm2b(at_handle)
+        .and_then(|p| p.name())
+        .map_err(|e| format!("object at {AK_HANDLE} is not an ECC AK ({e})"))?;
+    if r != h {
+        let hex = |n: &[u8]| n.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        return Err(format!(
+            "object at {AK_HANDLE} has name {}, the recorded AK has {}; refusing to use a key \
+             that is not the one provisioned (DDR-005 decision 4)",
+            hex(&h),
+            hex(&r)
+        ));
+    }
+    Ok(())
+}
+
+/// Before any use of the AK: the object at `AK_HANDLE` must be the AK whose
+/// public area was recorded at provisioning (`recorded`, `keys/ak.pub`).
+pub fn verify_ak(recorded: &Path, work: &Path) -> R<()> {
+    if !handle_exists(AK_HANDLE)? {
+        return Err(format!("no object at {AK_HANDLE}; the recorded AK is not in this TPM"));
+    }
+    let rec = std::fs::read(recorded)
+        .map_err(|e| format!("read {}: {e}", recorded.display()))?;
+    let cur_path = work.join("ak.handle.pub");
+    read_ak_public(&cur_path)?;
+    let cur = std::fs::read(&cur_path)
+        .map_err(|e| format!("read {}: {e}", cur_path.display()))?;
+    same_ak(&rec, &cur)
 }
 
 /// Define the monotonic counter. A TPM NV counter can be incremented and read
@@ -250,7 +321,55 @@ pub fn quote(msg: &[u8], spec: &str, attest: &Path, sig: &Path) -> R<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pcr_spec;
+    use super::{listing_has, parse_pcr_spec, same_ak};
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let p = format!(
+            "{}/../attest-appraise/tests/fixtures/swtpm/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}"))
+    }
+
+    #[test]
+    fn listing_match_is_exact_per_line() {
+        let l = "- 0x81010001\n- 0x81010100\n";
+        assert!(listing_has(l, "0x81010100"));
+        assert!(listing_has(l, "0X81010100"));
+        assert!(!listing_has(l, "0x8101010"));
+        assert!(!listing_has(l, "0x81010003"));
+        assert!(!listing_has("", "0x81010100"));
+        // a handle inside other text is not a listing entry
+        assert!(!listing_has("error near 0x81010100\n", "0x81010100"));
+    }
+
+    #[test]
+    fn same_public_area_is_the_same_ak() {
+        let ak = fixture("ak.pub");
+        assert!(same_ak(&ak, &ak).is_ok());
+    }
+
+    #[test]
+    fn another_key_at_the_handle_is_refused() {
+        let err = same_ak(&fixture("ak.pub"), &fixture("not-ak.pub")).unwrap_err();
+        assert!(err.contains("refusing"), "{err}");
+    }
+
+    #[test]
+    fn one_changed_byte_changes_the_name() {
+        let ak = fixture("ak.pub");
+        let mut other = ak.clone();
+        let last = other.len() - 1; // inside unique.y
+        other[last] ^= 1;
+        assert!(same_ak(&ak, &other).is_err());
+    }
+
+    #[test]
+    fn a_pem_recorded_by_an_older_agent_is_refused() {
+        let pem = b"-----BEGIN PUBLIC KEY-----\n".to_vec();
+        let err = same_ak(&pem, &fixture("ak.pub")).unwrap_err();
+        assert!(err.contains("re-provision"), "{err}");
+    }
 
     #[test]
     fn default_bank_and_pcrs_0_7() {
