@@ -7,7 +7,7 @@ them as `DDR-00N decision M` or `boundary X`.
 | DDR | Subject | Status |
 |---|---|---|
 | [DDR-004](DDR-004-quote-envelope-v2.md) | Envelope v2: the signed object is a `TPM2_Quote` under a restricted AK | accepted, implemented |
-| [DDR-005](DDR-005-ak-registration.md) | Registering the AK against the TPM endorsement key | accepted, not implemented |
+| [DDR-005](DDR-005-ak-registration.md) | Registering the AK against the TPM endorsement key | accepted, partly implemented |
 
 DDR-001 to DDR-003 belong to a closed component and are not published here.
 Most comments that cite them also state the decision they rely on, in place.
