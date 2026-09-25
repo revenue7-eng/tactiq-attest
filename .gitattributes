@@ -1,0 +1,4 @@
+# Test fixtures are raw TPM output (signatures, TPMS_ATTEST, TPM2B_PUBLIC).
+# Some contain 0x0a and no NUL, so git would guess "text" and an
+# autocrlf checkout would rewrite them, breaking real TPM signatures.
+crates/attest-appraise/tests/fixtures/** binary
