@@ -220,19 +220,24 @@ where
 /// Run gate 1 over one envelope, v1 (`attest = None`) or v2 (`attest =
 /// Some(TPMS_ATTEST bytes)`).
 ///
-/// Order, each step load-bearing (DDR-004 decision 3):
+/// Order, each step load-bearing, numbered as in DDR-004 decision 3:
 /// 1. parse the fixed layout (device_id is read from the signed area);
 /// 2. `entry_for(device_id)`; `None` refuses as `UnknownDevice`;
 /// 3. the envelope form must match the entry: AK with quote, legacy without;
-/// 4. v2: parse `TPMS_ATTEST` (magic, type quote), refusal is `Malformed`;
+///    refusal is `QuoteBindingFail`;
+/// 4. v2: parse `TPMS_ATTEST` (magic, type quote); refusal is `Malformed`;
 /// 5. verify ECDSA P-256 over SHA-256 of the signed object (`.msg` for v1,
-///    `.attest` for v2), DER or raw r||s;
-/// 6. v2 only, after step 5: `extraData`, selection, `pcrDigest` against the
-///    message, refusal is `QuoteBindingFail`;
-/// 7. only then compare the bundle digest with the signed `evidence_hash`.
-///    Before step 5 holds, every compared field is attacker-chosen and the
-///    comparison would prove nothing (DDR-002 decision 5 boundary D, DDR-004
-///    boundary A).
+///    `.attest` for v2), DER or raw r||s; refusal is `SignatureFail`;
+/// 6. v2: `extraData` equals SHA-256 of the message;
+/// 7. v2: one PCR bank equal to the message's `pcr_selection`, and
+///    `pcrDigest` equal to its `pcr_hash`; refusal at 6 or 7 is
+///    `QuoteBindingFail`;
+/// 8. only then compare the bundle digest with the signed `evidence_hash`;
+///    refusal is `EvidenceBindingFail`.
+///
+/// Before step 5 holds, every compared field is attacker-chosen and the
+/// comparison would prove nothing (DDR-002 decision 5 boundary D, DDR-004
+/// boundary A).
 pub fn authenticate_envelope<F>(
     msg_bytes: &[u8],
     attest: Option<&[u8]>,
