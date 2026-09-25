@@ -19,3 +19,11 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup target add wasm32-unknown-unknown
       - run: cargo build -p attest-appraise --release --target wasm32-unknown-unknown
+
+  # The registrar is its own workspace (tools/registrar/Cargo.toml), so
+  # `cargo test --workspace` above does not reach it.
+  registrar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --manifest-path tools/registrar/Cargo.toml

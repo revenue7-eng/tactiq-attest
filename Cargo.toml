@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/attest-envelope", "crates/attest-appraise", "crates/prover"]
+# The registrar has its own workspace and lock file; see tools/registrar/Cargo.toml.
+exclude = ["tools/registrar"]
 
 [workspace.package]
 edition = "2021"

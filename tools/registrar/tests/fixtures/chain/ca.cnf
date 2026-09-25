@@ -1,0 +1,30 @@
+[root]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+[int]
+basicConstraints = critical, CA:TRUE, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+extendedKeyUsage = 2.23.133.8.1
+[int_nosign]
+basicConstraints = critical, CA:TRUE, pathlen:0
+keyUsage = critical, cRLSign
+[ek]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, keyEncipherment
+subjectAltName = critical, dirName:tpm_dn
+extendedKeyUsage = 2.23.133.8.1
+[ek_noeku]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, keyEncipherment
+subjectAltName = critical, dirName:tpm_dn
+[ek_unknown_critical]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, keyEncipherment
+subjectAltName = critical, dirName:tpm_dn
+extendedKeyUsage = 2.23.133.8.1
+1.3.6.1.4.1.99999.1 = critical, ASN1:NULL
+[tpm_dn]
+a.2.23.133.2.1 = id:54455354
+a.2.23.133.2.2 = TEST TPM
+a.2.23.133.2.3 = id:0001
