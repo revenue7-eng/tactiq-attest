@@ -1,6 +1,9 @@
 # DDR-005: Registering the attestation key against the endorsement key
 
-Status: accepted, not implemented
+Status: accepted, partly implemented. Key placement and the name check:
+`prover` 0.3.0. Registration tool: `tools/registrar`. Agent registration
+commands: not implemented; they follow the device transport DDR (see "Not in
+scope").
 Base: tactiq-attest `main` @ `60de57e` (envelope v2, DDR-004)
 Scope: `prover` (key placement, registration commands), registration record
 format, a registration tool outside `attest-appraise`. Device-side transport
@@ -150,9 +153,9 @@ E. The protocol relies on the TPM refusing `TPM2_ActivateCredential` for an
    object loaded without its private part (`TPM2_LoadExternal`, public area
    only). Otherwise a holder of the device could load the public area of a
    software key with the AK attributes and register it. The reference
-   implementation refuses (Verification, swtpm). A TPM that does not refuse
-   cannot be registered under this DDR; the case is part of the hardware
-   negative runs.
+   implementation (swtpm) and the Infineon SLB9670 both refuse (Verification).
+   A TPM that does not refuse cannot be registered under this DDR; a new TPM
+   model is checked for this before its first registration.
 
 ## Not in scope
 
@@ -220,6 +223,38 @@ therefore carry the secret back through the console. The record still
 publishes `SHA-256(secret)` rather than the secret (decision 6), which keeps
 the published record the same whether or not the secret was seen.
 
-Still to do: the registration tool (decision 7), the agent side for the bench
-and then for the release image, and the negative cases on hardware: another
-AK, a foreign certificate, and the public-only object of boundary E.
+**Registrar, swtpm** (tools/registrar, swtpm 0.7.3, EK certificate from the
+swtpm local CA): with `tactiq-agent` 0.3.0 provisioned, a blob from the
+registrar opened with `tpm2_activatecredential` under the AK at `0x81010100`,
+and `complete` and `verify` accepted the result. A blob made from a foreign EK
+certificate (the Infineon chain) released no secret; libtpms answers
+`TPM_RC_FAILURE` there and stays responsive, so success is judged by the
+secret matching, not by an error code.
+
+**Rock 5A, Infineon SLB9670, 25 Sep 2026** (dev image rc11, tpm2-tools 5.7,
+tpm2-tss 4.1.3), transient objects only; afterwards the persistent handles
+were `0x81010001` and `0x81010002` (the v1 agent's objects), nothing else:
+
+- control: an AK created with `tpm2_createak` under the recreated EK (name
+  `000b78fc…b35c` as reported by the TPM and as computed from its public
+  area); the registrar (`main` @ `49f7ce8`) checked the EK certificate chain
+  (EK certificate sha256 `10661f65…a103`, root sha256 `899e3547…4f3b`) and
+  made the blob from the certificate's key; the TPM released the secret,
+  `complete` matched it and `verify` accepted the record. The record is
+  unsigned and internal (decision 6);
+- another AK: a blob made for another name, activated with the AK above, was
+  refused with `TPM_RC_INTEGRITY` (`0x1DF`);
+- boundary E: the public area of a P-256 key generated off the board, with
+  the AK attributes, was loaded with `tpm2_loadexternal` in the four variants
+  of the swtpm run (empty `authPolicy`; `authPolicy` PolicyCommandCode
+  satisfied by a policy session; plus `adminwithpolicy`; loaded in the
+  endorsement hierarchy). The TPM accepted every load and refused every
+  activation with `TPM_RC_AUTH_UNAVAILABLE` (`0x12F`); no output file was
+  written. The registrar had accepted all three public areas, since the
+  DDR-004 decision 4 rule judges attributes only: the refusal is the TPM's.
+
+Files were carried to the board as `printf` octal escapes and checked by
+SHA-256 there; the AK public area came back as hex and was checked by name.
+
+Still to do: the agent side, after the device transport DDR; a foreign
+certificate on hardware, which needs a second TPM (shown on swtpm above).
