@@ -13,13 +13,19 @@
 //! unlikely.
 //!
 //! Commands
-//!   provision   first boot: create AK, define counter, assign identity
+//!   provision   first boot: create AK under the EK, define counter, assign identity
 //!   attest      one cycle: advance counter, measure, build envelope, quote
 //!
 //! Envelope v2 (DDR-004): `<stem>.msg` is the 93-byte message above,
 //! `<stem>.attest` the `TPMS_ATTEST` of a TPM quote whose qualifying data is
 //! SHA-256 of the message, `<stem>.sig` the AK signature over `.attest`.
 //!   run         attest on an interval, feeding the systemd watchdog
+//!   status      report provisioning state and whether the AK is in place
+//!
+//! The AK lives at `tpm::AK_HANDLE` in the endorsement hierarchy (DDR-005).
+//! The agent never adopts an object because it occupies that handle: before
+//! every use it compares the object's name with the AK public area recorded at
+//! provisioning (`keys/ak.pub`), and refuses on any difference.
 //!
 //! Everything TPM-facing is in `tpm.rs`; everything disk-facing is in `state.rs`.
 
@@ -120,6 +126,10 @@ fn cmd_status(paths: &Paths) -> Result<(), String> {
     match state::inspect(paths) {
         Provisioning::Complete => {
             println!("provisioned: {}", state::read_id(paths)?);
+            let work = PathBuf::from(env_or("TACTIQ_WORK_DIR", DEFAULT_WORK_DIR));
+            ensure_dir(&work)?;
+            tpm::verify_ak(&paths.pubkey(), &work)?;
+            println!("ak: {} matches {}", tpm::AK_HANDLE, paths.pubkey().display());
             Ok(())
         }
         Provisioning::Absent => {
@@ -157,16 +167,24 @@ fn cmd_provision(paths: &Paths, work: &Path, id: &str) -> Result<(), String> {
         Provisioning::Absent => {}
     }
 
-    // The TPM may already hold objects from an interrupted run. Reuse rather
-    // than recreate: evicting and recreating the key would invalidate a public
-    // key the verifier may already have been given.
-    if !tpm::handle_exists(tpm::PARENT_HANDLE) {
-        tpm::create_primary(work)?;
+    // An occupied AK handle is never adopted (DDR-005 decision 4). With no
+    // recorded public area there is nothing to compare its name with, so the
+    // object could be anyone's: a key left by an interrupted run of this
+    // agent, or one placed there by something else. Freeing the handle is a
+    // deliberate act by the operator, not a repair the agent makes.
+    if tpm::handle_exists(tpm::AK_HANDLE)? {
+        return Err(format!(
+            "{h} already holds an object and this device has no recorded AK; \
+             the agent does not adopt a key by its handle. If it is left from an \
+             interrupted provisioning, evict it deliberately \
+             (tpm2_evictcontrol -C o -c {h}) and provision again",
+            h = tpm::AK_HANDLE
+        ));
     }
-    if !tpm::handle_exists(tpm::AK_HANDLE) {
-        tpm::create_ak(work)?;
-    }
-    if !tpm::nv_defined(tpm::NV_COUNTER) {
+    tpm::create_ak(work)?;
+    // The counter is kept across agent versions (DDR-005 decision 4): it only
+    // ever moves forward, and reusing it costs nothing.
+    if !tpm::nv_defined(tpm::NV_COUNTER)? {
         tpm::nv_define()?;
     }
 
@@ -206,6 +224,9 @@ fn cmd_attest(paths: &Paths, work: &Path, out_dir: &str, pcr_spec: &str) -> Resu
     // and do it before touching the NV counter so a malformed spec cannot burn
     // a counter value on every attempt.
     let (alg_id, bitmap) = tpm::parse_pcr_spec(pcr_spec)?;
+
+    // The AK must be the provisioned one before a counter value is spent on it.
+    tpm::verify_ak(&paths.pubkey(), work)?;
 
     // Order matters: advance the counter before measuring. If the process dies
     // after the increment, the burned value is simply never used — a gap in the
