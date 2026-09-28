@@ -22,7 +22,8 @@ path = "src/main.rs"
 # the verifier and the agent use, so there is one rule and one name function.
 attest-appraise = { path = "../../crates/attest-appraise" }
 attest-envelope = { path = "../../crates/attest-envelope" }
-x509-cert = { version = "0.2", default-features = false }
+x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
+cms = { version = "0.2", default-features = false }
 der = { version = "0.7", features = ["std"] }
 rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
 sha2 = "0.10"

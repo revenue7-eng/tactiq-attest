@@ -9,11 +9,15 @@
 //! rely on the secret staying confidential after the TPM releases it (DDR-005,
 //! "The secret on the console"); the file mode is ordinary hygiene.
 //!
-//! A record from this tool is unsigned. Until the `Registration Signer` leaf
-//! exists (decision 6), a record is internal and never presented as L3.
+//! A record from this tool is unsigned: it is signed afterwards as a file by
+//! the `Registration Signer` leaf (decision 6), detached, and `verify --sig`
+//! checks that signature (`signature.rs`). The record's own `signed` field
+//! stays `false`; a signature is a separate file, never a field. An unsigned
+//! record is internal and never presented as L3.
 
 mod chain;
 mod makecred;
+mod signature;
 
 use std::fs;
 use std::io::Write;
@@ -94,7 +98,8 @@ fn main() {
                  begin     --state DIR --device-id ID --ak-public FILE --ek-cert FILE\n\
                  \x20         --intermediate FILE --root FILE --registrar NAME\n\
                  complete  --state DIR --answer FILE\n\
-                 verify    --record FILE --root FILE [--emit-ak FILE]"
+                 verify    --record FILE --root FILE [--emit-ak FILE]\n\
+                 \x20         [--sig FILE.p7s --release-root FILE]"
             );
             std::process::exit(2);
         }
@@ -304,9 +309,13 @@ fn unhex(field: &str, v: &str) -> R<Vec<u8>> {
 }
 
 fn cmd_verify(o: &Opts) -> R<()> {
-    let rec: Record = serde_json::from_slice(&read(o.get("record")?)?).map_err(|e| format!("record: {e}"))?;
+    let record_bytes = read(o.get("record")?)?;
+    let rec: Record = serde_json::from_slice(&record_bytes).map_err(|e| format!("record: {e}"))?;
     if rec.format != RECORD_FORMAT {
         return Err(format!("record format {}", rec.format));
+    }
+    if rec.signed {
+        return Err("record field `signed` is true; this tool writes false and checks a detached signature (--sig)".into());
     }
     validate_id(&rec.device_id)?;
     if rec.revocation_checked {
@@ -335,10 +344,27 @@ fn cmd_verify(o: &Opts) -> R<()> {
         return Err("secret_sha256 is not 32 bytes".into());
     }
 
+    // The signature is judged last, after the record itself holds, and at the
+    // current time: a record stops verifying when a certificate above it
+    // expires, the Signing CA included.
+    let signer = match (o.opt("sig"), o.opt("release-root")) {
+        (Some(p7s), Some(root)) => {
+            let root_der = signature::cert_der(&read(root)?, "release root")?;
+            Some(signature::verify(&record_bytes, &read(p7s)?, &root_der, now())?)
+        }
+        (None, None) => None,
+        _ => return Err("--sig and --release-root go together".into()),
+    };
+
     println!("record ok   {} (chain at {}, AK rule, AK name, blob layout)", rec.device_id, rec.chain_checked_utc);
     println!("not checked: the blob contents (activate on the device), revocation, who registered");
-    if !rec.signed {
-        println!("unsigned: internal only, not L3");
+    match signer {
+        Some(s) => {
+            println!("signed      by {} (serial {})", s.leaf_subject, s.leaf_serial);
+            println!("            Signing CA {}; release root sha256 {}", s.signing_ca_subject, s.root_sha256);
+            println!("            signer EKU is the registration purpose; certificates valid now");
+        }
+        None => println!("unsigned: internal only, not L3"),
     }
     if let Some(p) = o.opt("emit-ak") {
         write_new(Path::new(p), &ak_public, 0o644)?;
