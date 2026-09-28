@@ -24,3 +24,20 @@ attributes, extended key usage 2.23.133.8.1), generated with OpenSSL from
 
 The real Infineon chain of the bench SLB9670 is not a fixture; see the ignored
 test `infineon_chain_from_env` in `src/chain.rs`.
+
+## signature/
+
+A throwaway release hierarchy made with `gen-pki.sh prod`, `regsigner-prod`
+and `rim-prod` from tactiq-os (passphrases off for the run), used once and
+deleted with its private keys. The certificates are valid from 28 Sep 2026
+for three years (leaves and Signing CA); the tests judge validity at
+1 Oct 2026.
+
+- `root.pem`: the throwaway root. `other-root.pem`: a second, unrelated root.
+- `record.json`, `record-changed.json`: stand-in record bytes; the signature
+  covers bytes, so the content need not be a real record.
+- `record.json.p7s`: `openssl cms -sign -binary -noattr -md sha256` by the
+  Registration Signer leaf, Signing CA included, detached, DER.
+- `record.json.rim.p7s`: the same by the RIM signer leaf under the same root.
+- `record.json.attrs.p7s`: without `-noattr` (signed attributes present).
+- `record.json.embedded.p7s`: with `-nodetach` (content embedded).

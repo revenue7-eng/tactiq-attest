@@ -50,16 +50,16 @@ pub struct Chain {
     pub root_sha256: [u8; 32],
 }
 
-fn parse(der: &[u8], what: &str) -> Result<Certificate, String> {
+pub(crate) fn parse(der: &[u8], what: &str) -> Result<Certificate, String> {
     Certificate::from_der(der).map_err(|e| format!("{what}: not a DER certificate ({e})"))
 }
 
-fn rsa_key(c: &Certificate, what: &str) -> Result<RsaPublicKey, String> {
+pub(crate) fn rsa_key(c: &Certificate, what: &str) -> Result<RsaPublicKey, String> {
     let spki = c.tbs_certificate.subject_public_key_info.to_der().map_err(|e| format!("{what}: {e}"))?;
     RsaPublicKey::from_public_key_der(&spki).map_err(|e| format!("{what}: not an RSA key ({e})"))
 }
 
-fn check_alg(c: &Certificate, what: &str) -> Result<(), String> {
+pub(crate) fn check_alg(c: &Certificate, what: &str) -> Result<(), String> {
     let outer = c.signature_algorithm.oid.to_string();
     let inner = c.tbs_certificate.signature.oid.to_string();
     if outer != SHA256_WITH_RSA || inner != SHA256_WITH_RSA {
@@ -68,7 +68,7 @@ fn check_alg(c: &Certificate, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn check_signed_by(c: &Certificate, issuer_key: &RsaPublicKey, what: &str) -> Result<(), String> {
+pub(crate) fn check_signed_by(c: &Certificate, issuer_key: &RsaPublicKey, what: &str) -> Result<(), String> {
     let tbs = c.tbs_certificate.to_der().map_err(|e| format!("{what}: {e}"))?;
     let sig_bytes = c
         .signature
@@ -80,7 +80,7 @@ fn check_signed_by(c: &Certificate, issuer_key: &RsaPublicKey, what: &str) -> Re
         .map_err(|_| format!("{what}: signature does not verify under its issuer's key"))
 }
 
-fn check_issued_by(c: &Certificate, issuer: &Certificate, what: &str) -> Result<(), String> {
+pub(crate) fn check_issued_by(c: &Certificate, issuer: &Certificate, what: &str) -> Result<(), String> {
     let a = c.tbs_certificate.issuer.to_der().map_err(|e| format!("{what}: {e}"))?;
     let b = issuer.tbs_certificate.subject.to_der().map_err(|e| format!("{what}: {e}"))?;
     if a != b {
@@ -102,13 +102,13 @@ fn check_time(c: &Certificate, at: Duration, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-struct Ext {
-    basic: Option<BasicConstraints>,
-    key_usage: Option<KeyUsage>,
-    eku: Option<ExtendedKeyUsage>,
+pub(crate) struct Ext {
+    pub(crate) basic: Option<BasicConstraints>,
+    pub(crate) key_usage: Option<KeyUsage>,
+    pub(crate) eku: Option<ExtendedKeyUsage>,
 }
 
-fn extensions(c: &Certificate, what: &str) -> Result<Ext, String> {
+pub(crate) fn extensions(c: &Certificate, what: &str) -> Result<Ext, String> {
     let mut e = Ext { basic: None, key_usage: None, eku: None };
     for x in c.tbs_certificate.extensions.iter().flatten() {
         let id = x.extn_id.to_string();
@@ -130,7 +130,7 @@ fn extensions(c: &Certificate, what: &str) -> Result<Ext, String> {
     Ok(e)
 }
 
-fn check_ca(c: &Certificate, what: &str) -> Result<(), String> {
+pub(crate) fn check_ca(c: &Certificate, what: &str) -> Result<(), String> {
     let e = extensions(c, what)?;
     if !e.basic.map(|b| b.ca).unwrap_or(false) {
         return Err(format!("{what}: not a CA (basicConstraints cA is not TRUE)"));
