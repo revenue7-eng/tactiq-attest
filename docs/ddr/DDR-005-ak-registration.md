@@ -1,7 +1,8 @@
 # DDR-005: Registering the attestation key against the endorsement key
 
 Status: accepted, partly implemented. Key placement and the name check:
-`prover` 0.3.0. Registration tool: `tools/registrar`. Agent registration
+`prover` 0.3.0. Registration tool: `tools/registrar`, including the check of
+the record signature (`verify --sig`, decision 6). Agent registration
 commands: not implemented; they follow the device transport DDR (see "Not in
 scope").
 Base: tactiq-attest `main` @ `60de57e` (envelope v2, DDR-004)
@@ -119,8 +120,9 @@ Facts this design rests on:
    published. Rejected: the RIM Signer key (one key for two meanings, and
    revoking one would revoke the other); Sigstore through the release workflow
    (a second trust root for the reader, next to r2). The cost is one key
-   ceremony. Until the leaf exists, bench records stay internal and are not
-   presented as L3.
+   ceremony. Until the leaf existed, bench records stayed internal and were
+   not presented as L3. The leaf exists since 28 Sep 2026; the first signed
+   record is the one published with tactiq-os `v2.1.0-rc13` (Verification).
 
 7. **Registration is checked outside gate 1.** `attest-appraise` stays as it
    is: stateless, small, wasm-buildable, no X.509 and no RSA. A separate tool
@@ -163,7 +165,9 @@ E. The protocol relies on the TPM refusing `TPM2_ActivateCredential` for an
   login and no automount (automount was rejected as a new interface into a
   hardened device). This is the agent-side DDR that follows (registration
   subcommands and their transport).
-- The verification page reading the record (edge-reference-check).
+- The verification page reading the record (edge-reference-check). The page
+  shows the TPM name of the AK it was given, for the reader to compare with
+  the record's `ak_name`; it does not verify the record.
 - Pinning the Infineon root independently.
 
 ## Verification
@@ -255,6 +259,17 @@ were `0x81010001` and `0x81010002` (the v1 agent's objects), nothing else:
 
 Files were carried to the board as `printf` octal escapes and checked by
 SHA-256 there; the AK public area came back as hex and was checked by name.
+
+**Signed record, tactiq-os `v2.1.0-rc13`** (release asset
+`l3-evidence-rc13.tar.gz`; registrar `main` @ `8893034`). `verify --sig` on
+`registration-TACTIQ-BENCH-001.json` with its `.p7s`, the Infineon root from
+the archive (sha256 `899e3547…4f3b`) and the release root r2 accepted the
+record and the signature: signer `CN=TactiQ OS Release Registration Signer`
+under `CN=TactiQ Release Signing CA`, extended key usage exactly the
+registration purpose, critical, certificates valid at the time of the check.
+The record's `ak_name` (`000b35c0…0a0a`) is the name of the AK whose quotes are
+in the same archive. Not checked by the tool, and not claimed: the blob
+contents (boundary A), revocation (boundary D), who registered.
 
 Still to do: the agent side, after the device transport DDR; a foreign
 certificate on hardware, which needs a second TPM (shown on swtpm above).
