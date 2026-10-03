@@ -22,7 +22,7 @@
 //!   run         attest on an interval, feeding the systemd watchdog
 //!   status      report provisioning state and whether the AK is in place
 //!
-//! The AK lives at `tpm::AK_HANDLE` in the endorsement hierarchy (DDR-005).
+//! The AK lives at `tpm::ak_handle()` in the endorsement hierarchy (DDR-005).
 //! The agent never adopts an object because it occupies that handle: before
 //! every use it compares the object's name with the AK public area recorded at
 //! provisioning (`keys/ak.pub`), and refuses on any difference.
@@ -215,7 +215,8 @@ fn main() {
                    status                  report provisioning state\n\
                  \n\
                  env: TACTIQ_KEYS_DIR TACTIQ_OUT_DIR TACTIQ_WORK_DIR\n\
-                      TACTIQ_PCR_SPEC TACTIQ_INTERVAL_SECS TACTIQ_AUDIT_KEEP"
+                      TACTIQ_PCR_SPEC TACTIQ_INTERVAL_SECS TACTIQ_AUDIT_KEEP\n\
+                   TACTIQ_OWNER_AUTH_FILE TACTIQ_AK_HANDLE TACTIQ_NV_INDEX"
             );
             std::process::exit(2);
         }
@@ -240,7 +241,7 @@ fn cmd_status(paths: &Paths) -> Result<(), String> {
             let work = PathBuf::from(env_or("TACTIQ_WORK_DIR", DEFAULT_WORK_DIR));
             ensure_dir(&work)?;
             tpm::verify_ak(&paths.pubkey(), &work)?;
-            println!("ak: {} matches {}", tpm::AK_HANDLE, paths.pubkey().display());
+            println!("ak: {} matches {}", tpm::ak_handle()?, paths.pubkey().display());
             Ok(())
         }
         Provisioning::Absent => {
@@ -283,19 +284,20 @@ fn cmd_provision(paths: &Paths, work: &Path, id: &str) -> Result<(), String> {
     // object could be anyone's: a key left by an interrupted run of this
     // agent, or one placed there by something else. Freeing the handle is a
     // deliberate act by the operator, not a repair the agent makes.
-    if tpm::handle_exists(tpm::AK_HANDLE)? {
+    let akh = tpm::ak_handle()?;
+    if tpm::handle_exists(&akh)? {
         return Err(format!(
             "{h} already holds an object and this device has no recorded AK; \
              the agent does not adopt a key by its handle. If it is left from an \
              interrupted provisioning, evict it deliberately \
              (tpm2_evictcontrol -C o -c {h}) and provision again",
-            h = tpm::AK_HANDLE
+            h = akh
         ));
     }
     tpm::create_ak(work)?;
     // The counter is kept across agent versions (DDR-005 decision 4): it only
     // ever moves forward, and reusing it costs nothing.
-    if !tpm::nv_defined(tpm::NV_COUNTER)? {
+    if !tpm::nv_defined(&tpm::nv_counter()?)? {
         tpm::nv_define()?;
     }
 
