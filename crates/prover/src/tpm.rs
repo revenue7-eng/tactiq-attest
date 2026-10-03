@@ -32,7 +32,7 @@ use std::process::Command;
 /// A handle is never trusted by occupancy: every use of the object here is
 /// preceded by `verify_ak`, which compares its name with the one recorded at
 /// provisioning.
-pub const AK_HANDLE: &str = "0x81010100";
+pub const DEFAULT_AK_HANDLE: &str = "0x81010100";
 /// NV index holding the monotonic epoch counter.
 ///
 /// The agent advances it once per start, not once per envelope; the envelope
@@ -42,7 +42,72 @@ pub const AK_HANDLE: &str = "0x81010100";
 /// hash of the message, and the counter inside the message is whatever the
 /// agent put there. The only property the NV value provides is that no value
 /// is handed out twice across restarts, and one increment per start gives that.
-pub const NV_COUNTER: &str = "0x1500016";
+pub const DEFAULT_NV_COUNTER: &str = "0x1500016";
+
+/// Persistent handle of the AK: `TACTIQ_AK_HANDLE`, default
+/// `DEFAULT_AK_HANDLE`. A host TPM may already use the default for something
+/// else (another agent, a vendor tool); the handle is configurable so the
+/// prover can live next to it. Must be a persistent handle (0x81xxxxxx).
+pub fn ak_handle() -> R<String> {
+    handle_from_env("TACTIQ_AK_HANDLE", DEFAULT_AK_HANDLE, 0x8100_0000, 0x81FF_FFFF)
+}
+
+/// NV index of the epoch counter: `TACTIQ_NV_INDEX`, default
+/// `DEFAULT_NV_COUNTER`. Must be an NV index (0x01xxxxxx).
+pub fn nv_counter() -> R<String> {
+    handle_from_env("TACTIQ_NV_INDEX", DEFAULT_NV_COUNTER, 0x0100_0000, 0x01FF_FFFF)
+}
+
+fn handle_from_env(key: &str, default: &str, lo: u32, hi: u32) -> R<String> {
+    let v = std::env::var(key).unwrap_or_else(|_| default.to_string());
+    parse_handle(&v, lo, hi).map_err(|e| format!("{key}={v}: {e}"))
+}
+
+pub fn parse_handle(v: &str, lo: u32, hi: u32) -> R<String> {
+    let hex = v
+        .strip_prefix("0x")
+        .or_else(|| v.strip_prefix("0X"))
+        .ok_or("handle must be hex with 0x prefix")?;
+    let n = u32::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
+    if n < lo || n > hi {
+        return Err(format!("outside 0x{lo:08x}..0x{hi:08x}"));
+    }
+    Ok(format!("0x{n:x}"))
+}
+
+/// Owner hierarchy authorization, for hosts where it is set (a Windows-
+/// provisioned TPM, an enterprise server policy). Read from the file named by
+/// `TACTIQ_OWNER_AUTH_FILE` as raw bytes and handed to tpm2-tools as
+/// `file:<path>`, so the secret never appears in argv or in the environment.
+/// Unset means an empty owner auth, as on the bench and on TactiQ OS.
+fn owner_auth() -> R<Option<String>> {
+    match std::env::var("TACTIQ_OWNER_AUTH_FILE") {
+        Err(_) => Ok(None),
+        Ok(p) => {
+            std::fs::metadata(&p).map_err(|e| format!("TACTIQ_OWNER_AUTH_FILE={p}: {e}"))?;
+            Ok(Some(format!("file:{p}")))
+        }
+    }
+}
+
+/// Run a tpm2-tools command authorized by the owner hierarchy, appending
+/// `-P file:<path>` when an owner auth is configured.
+fn run_owner(args: &[&str]) -> R<Vec<u8>> {
+    let auth = owner_auth()?;
+    let mut v: Vec<&str> = args.to_vec();
+    if let Some(a) = auth.as_deref() {
+        v.push("-P");
+        v.push(a);
+    }
+    run(&v).map_err(|e| match auth {
+        None if e.contains("auth") || e.contains("0x9a2") || e.contains("0x98e") => format!(
+            "{e}\nhint: the owner hierarchy has an authorization on this TPM (a Windows-managed \
+             or policy-provisioned TPM); write it as raw bytes to a 0600 file and set \
+             TACTIQ_OWNER_AUTH_FILE to its path"
+        ),
+        _ => e,
+    })
+}
 
 /// TPMA_NV_ORDERLY (TPM 2.0 Part 2, Table 205, bit 26).
 const TPMA_NV_ORDERLY: u32 = 1 << 26;
@@ -108,9 +173,9 @@ fn create_ek(work: &Path) -> R<String> {
 }
 
 /// Create the ECDSA P-256 attestation key (AK) under the EK, in the
-/// endorsement hierarchy (DDR-005 decision 3), and persist it at `AK_HANDLE`.
+/// endorsement hierarchy (DDR-005 decision 3), and persist it at `ak_handle()`.
 ///
-/// The caller must have checked that `AK_HANDLE` is free.
+/// The caller must have checked that `ak_handle()` is free.
 ///
 /// In the endorsement hierarchy the quote carries `resetCount`,
 /// `restartCount` and `firmwareVersion` in the clear; under an owner parent
@@ -155,7 +220,8 @@ pub fn create_ak(work: &Path) -> R<()> {
     let _ = run(&["tpm2_flushcontext", "-t"]);
     // Persisting the key means the quote path needs no transient load per
     // cycle: one TPM object, reused for the life of the device.
-    run(&["tpm2_evictcontrol", "-C", "o", "-c", &ctx, AK_HANDLE])?;
+    let h = ak_handle()?;
+    run_owner(&["tpm2_evictcontrol", "-C", "o", "-c", &ctx, &h])?;
     let _ = run(&["tpm2_flushcontext", "-t"]);
     Ok(())
 }
@@ -166,7 +232,8 @@ pub fn create_ak(work: &Path) -> R<()> {
 /// a PEM would drop them.
 pub fn read_ak_public(out: &Path) -> R<()> {
     let out = out.to_string_lossy().to_string();
-    run(&["tpm2_readpublic", "-c", AK_HANDLE, "-o", &out])?;
+    let h = ak_handle()?;
+    run(&["tpm2_readpublic", "-c", &h, "-o", &out])?;
     Ok(())
 }
 
@@ -181,13 +248,14 @@ pub fn same_ak(recorded: &[u8], at_handle: &[u8]) -> R<()> {
         .and_then(|p| p.name())
         .map_err(|e| format!("recorded AK public area unusable ({e}); \
                   it was not written by this agent version, re-provision deliberately"))?;
+    let akh = ak_handle().unwrap_or_else(|_| DEFAULT_AK_HANDLE.to_string());
     let h = EccPublic::parse_tpm2b(at_handle)
         .and_then(|p| p.name())
-        .map_err(|e| format!("object at {AK_HANDLE} is not an ECC AK ({e})"))?;
+        .map_err(|e| format!("object at {akh} is not an ECC AK ({e})"))?;
     if r != h {
         let hex = |n: &[u8]| n.iter().map(|b| format!("{b:02x}")).collect::<String>();
         return Err(format!(
-            "object at {AK_HANDLE} has name {}, the recorded AK has {}; refusing to use a key \
+            "object at {akh} has name {}, the recorded AK has {}; refusing to use a key \
              that is not the one provisioned (DDR-005 decision 4)",
             hex(&h),
             hex(&r)
@@ -196,11 +264,12 @@ pub fn same_ak(recorded: &[u8], at_handle: &[u8]) -> R<()> {
     Ok(())
 }
 
-/// Before any use of the AK: the object at `AK_HANDLE` must be the AK whose
+/// Before any use of the AK: the object at `ak_handle()` must be the AK whose
 /// public area was recorded at provisioning (`recorded`, `keys/ak.pub`).
 pub fn verify_ak(recorded: &Path, work: &Path) -> R<()> {
-    if !handle_exists(AK_HANDLE)? {
-        return Err(format!("no object at {AK_HANDLE}; the recorded AK is not in this TPM"));
+    let akh = ak_handle()?;
+    if !handle_exists(&akh)? {
+        return Err(format!("no object at {akh}; the recorded AK is not in this TPM"));
     }
     let rec = std::fs::read(recorded)
         .map_err(|e| format!("read {}: {e}", recorded.display()))?;
@@ -215,12 +284,13 @@ pub fn verify_ak(recorded: &Path, work: &Path) -> R<()> {
 /// but never set or rolled back, which is what makes freshness work without a
 /// nonce, a clock, or a network round trip.
 pub fn nv_define() -> R<()> {
-    run(&[
-        "tpm2_nvdefine", NV_COUNTER, "-C", "o",
+    let nv = nv_counter()?;
+    run_owner(&[
+        "tpm2_nvdefine", &nv, "-C", "o",
         "-a", "nt=counter|ownerread|ownerwrite",
     ])?;
     // A freshly defined counter is not readable until first increment.
-    run(&["tpm2_nvincrement", NV_COUNTER, "-C", "o"])?;
+    run_owner(&["tpm2_nvincrement", &nv, "-C", "o"])?;
     Ok(())
 }
 
@@ -232,18 +302,19 @@ pub fn nv_define() -> R<()> {
 /// so an epoch taken from it can repeat, and with it every envelope counter of
 /// that epoch. A non-counter index has no monotonic guarantee at all.
 pub fn check_counter_attributes(attrs: u32) -> R<()> {
+    let nv = nv_counter().unwrap_or_else(|_| DEFAULT_NV_COUNTER.to_string());
     if attrs & TPMA_NV_TPM_NT_MASK != TPM_NT_COUNTER {
         return Err(format!(
-            "{NV_COUNTER} is not a counter index (attributes 0x{attrs:08x})"
+            "{nv} is not a counter index (attributes 0x{attrs:08x})"
         ));
     }
     if attrs & TPMA_NV_ORDERLY != 0 {
         return Err(format!(
-            "{NV_COUNTER} is orderly (attributes 0x{attrs:08x}): its value can roll \
+            "{nv} is orderly (attributes 0x{attrs:08x}): its value can roll \
              back after a power cut, so it cannot carry the epoch. Recreate it \
-             without orderly: tpm2_nvundefine {NV_COUNTER} -C o; tpm2_nvdefine \
-             {NV_COUNTER} -C o -a \"nt=counter|ownerread|ownerwrite\"; \
-             tpm2_nvincrement {NV_COUNTER} -C o"
+             without orderly: tpm2_nvundefine {nv} -C o; tpm2_nvdefine \
+             {nv} -C o -a \"nt=counter|ownerread|ownerwrite\"; \
+             tpm2_nvincrement {nv} -C o"
         ));
     }
     Ok(())
@@ -276,7 +347,8 @@ fn parse_nv_attributes(listing: &str) -> R<u32> {
 
 /// Check the counter index before an epoch is taken from it.
 pub fn verify_counter() -> R<()> {
-    let o = run(&["tpm2_nvreadpublic", NV_COUNTER])?;
+    let nv = nv_counter()?;
+    let o = run(&["tpm2_nvreadpublic", &nv])?;
     check_counter_attributes(parse_nv_attributes(&String::from_utf8_lossy(&o))?)
 }
 
@@ -286,10 +358,11 @@ pub fn verify_counter() -> R<()> {
 /// TPM can never produce again. Two cycles cannot share a counter value even if
 /// they race.
 pub fn nv_increment_and_read(work: &Path) -> R<u64> {
-    run(&["tpm2_nvincrement", NV_COUNTER, "-C", "o"])?;
+    let nv = nv_counter()?;
+    run_owner(&["tpm2_nvincrement", &nv, "-C", "o"])?;
     let f = work.join("counter.bin");
     let fs_ = f.to_string_lossy().to_string();
-    run(&["tpm2_nvread", NV_COUNTER, "-C", "o", "-o", &fs_])?;
+    run_owner(&["tpm2_nvread", &nv, "-C", "o", "-o", &fs_])?;
     let raw = std::fs::read(&f).map_err(|e| format!("read counter: {e}"))?;
     if raw.len() != 8 {
         return Err(format!("counter is {} bytes, expected 8", raw.len()));
@@ -382,8 +455,9 @@ pub fn quote(msg: &[u8], spec: &str, attest: &Path, sig: &Path) -> R<()> {
     let qd = attest_envelope::tpm::qualifying_data(msg)?;
     let hex: String = qd.iter().map(|b| format!("{b:02x}")).collect();
     let (a, s) = (attest.to_string_lossy().to_string(), sig.to_string_lossy().to_string());
+    let h = ak_handle()?;
     run(&[
-        "tpm2_quote", "-c", AK_HANDLE, "-l", spec, "-q", &hex,
+        "tpm2_quote", "-c", &h, "-l", spec, "-q", &hex,
         "-m", &a, "-s", &s, "-g", "sha256", "-f", "plain",
     ])?;
     Ok(())
@@ -392,8 +466,21 @@ pub fn quote(msg: &[u8], spec: &str, attest: &Path, sig: &Path) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_counter_attributes, listing_has, parse_nv_attributes, parse_pcr_spec, same_ak,
+        check_counter_attributes, listing_has, parse_handle, parse_nv_attributes, parse_pcr_spec,
+        same_ak,
     };
+
+    #[test]
+    fn handle_ranges() {
+        assert_eq!(parse_handle("0x81010100", 0x8100_0000, 0x81FF_FFFF).unwrap(), "0x81010100");
+        assert_eq!(parse_handle("0X81010200", 0x8100_0000, 0x81FF_FFFF).unwrap(), "0x81010200");
+        assert_eq!(parse_handle("0x1500016", 0x0100_0000, 0x01FF_FFFF).unwrap(), "0x1500016");
+        // an NV index where a persistent handle is expected, and the reverse
+        assert!(parse_handle("0x1500016", 0x8100_0000, 0x81FF_FFFF).is_err());
+        assert!(parse_handle("0x81010100", 0x0100_0000, 0x01FF_FFFF).is_err());
+        assert!(parse_handle("81010100", 0x8100_0000, 0x81FF_FFFF).is_err());
+        assert!(parse_handle("0xzz", 0x8100_0000, 0x81FF_FFFF).is_err());
+    }
 
     fn fixture(name: &str) -> Vec<u8> {
         let p = format!(
