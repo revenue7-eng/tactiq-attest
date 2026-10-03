@@ -94,5 +94,19 @@ Unit tests in `crates/prover`: counter composition and ordering across
 epochs and against the old maximum, refusal of out of range parts, attribute
 check on the bench values (`0x20020012` accepted, `0x24020012` refused),
 parsing of `tpm2_nvreadpublic` output, and pruning on a real directory
-(oldest stems go with all four files, other files stay). On hardware: to be
-recorded when the agent built from this change has run on the bench.
+(oldest stems go with all four files, other files stay).
+
+On hardware, Rock 5A with SLB9670, `tactiq-image-dev` build 20261003073848
+(tactiq-os 677f12b, this change at b853253), written to slot A:
+
+| Check | Observed |
+|---|---|
+| Start on the orderly index left by the earlier experiment (`0x24020012`) | agent refused three times with the recreate instructions, systemd stopped it; counter (260) and envelopes (8035) untouched |
+| Index recreated without `orderly` | `ownerwrite\|nt=0x1\|ownerread\|written`; a fresh counter starts at the highest value any counter on the chip has held, so the first epoch was 8039 and the first envelope `134872039424` (8039 << 24) |
+| Cycles within an epoch | counter +1 every 30 s, the NV value stayed at 8039 |
+| Agent restart | next epoch, 8040, one NV write |
+| Power cut without shutdown | next epoch, 8041, first envelope `134905593856`; no roll back |
+| Audit bound | 8035 envelopes reduced to 2880 on the first cycle |
+
+The power cut row is the one the earlier orderly index failed: it came back
+at 256 after reaching 8039.
