@@ -33,8 +33,22 @@ use std::process::Command;
 /// preceded by `verify_ak`, which compares its name with the one recorded at
 /// provisioning.
 pub const AK_HANDLE: &str = "0x81010100";
-/// NV index holding the monotonic counter that provides freshness.
+/// NV index holding the monotonic epoch counter.
+///
+/// The agent advances it once per start, not once per envelope; the envelope
+/// counter is `(epoch << SEQ_BITS) | seq` with `seq` kept in memory (main.rs).
+/// Incrementing NV on every cycle wore the chip (2880 writes a day at the 30 s
+/// default) without adding anything the TPM vouches for: the quote signs a
+/// hash of the message, and the counter inside the message is whatever the
+/// agent put there. The only property the NV value provides is that no value
+/// is handed out twice across restarts, and one increment per start gives that.
 pub const NV_COUNTER: &str = "0x1500016";
+
+/// TPMA_NV_ORDERLY (TPM 2.0 Part 2, Table 205, bit 26).
+const TPMA_NV_ORDERLY: u32 = 1 << 26;
+/// TPMA_NV_TPM_NT field (bits 7:4) and the value for a counter index.
+const TPMA_NV_TPM_NT_MASK: u32 = 0xF << 4;
+const TPM_NT_COUNTER: u32 = 0x1 << 4;
 
 pub type R<T> = Result<T, String>;
 
@@ -210,6 +224,62 @@ pub fn nv_define() -> R<()> {
     Ok(())
 }
 
+/// Refuse a counter index the epoch scheme cannot rely on.
+///
+/// An orderly counter keeps its value in TPM RAM and flushes it to NV only
+/// every TPM2_PT_ORDERLY_COUNT increments or on TPM2_Shutdown. On the bench a
+/// freshly defined orderly index went from 8039 back to 256 after a power cut,
+/// so an epoch taken from it can repeat, and with it every envelope counter of
+/// that epoch. A non-counter index has no monotonic guarantee at all.
+pub fn check_counter_attributes(attrs: u32) -> R<()> {
+    if attrs & TPMA_NV_TPM_NT_MASK != TPM_NT_COUNTER {
+        return Err(format!(
+            "{NV_COUNTER} is not a counter index (attributes 0x{attrs:08x})"
+        ));
+    }
+    if attrs & TPMA_NV_ORDERLY != 0 {
+        return Err(format!(
+            "{NV_COUNTER} is orderly (attributes 0x{attrs:08x}): its value can roll \
+             back after a power cut, so it cannot carry the epoch. Recreate it \
+             without orderly: tpm2_nvundefine {NV_COUNTER} -C o; tpm2_nvdefine \
+             {NV_COUNTER} -C o -a \"nt=counter|ownerread|ownerwrite\"; \
+             tpm2_nvincrement {NV_COUNTER} -C o"
+        ));
+    }
+    Ok(())
+}
+
+/// The `value:` of the `attributes:` block in `tpm2_nvreadpublic <index>`
+/// output. The hash algorithm block has a `value:` line too, so the search
+/// starts after `attributes:`.
+fn parse_nv_attributes(listing: &str) -> R<u32> {
+    let mut lines = listing.lines().map(str::trim);
+    lines
+        .by_ref()
+        .find(|l| *l == "attributes:")
+        .ok_or("no attributes block in tpm2_nvreadpublic output")?;
+    for l in lines {
+        if let Some(v) = l.strip_prefix("value:") {
+            let v = v.trim();
+            let hex = v
+                .strip_prefix("0x")
+                .or_else(|| v.strip_prefix("0X"))
+                .ok_or_else(|| format!("attributes value is not hex: {v}"))?;
+            return u32::from_str_radix(hex, 16).map_err(|e| format!("attributes value {v}: {e}"));
+        }
+        if l.ends_with(':') && !l.starts_with("friendly") {
+            break;
+        }
+    }
+    Err("no value line in the attributes block".into())
+}
+
+/// Check the counter index before an epoch is taken from it.
+pub fn verify_counter() -> R<()> {
+    let o = run(&["tpm2_nvreadpublic", NV_COUNTER])?;
+    check_counter_attributes(parse_nv_attributes(&String::from_utf8_lossy(&o))?)
+}
+
 /// Advance the counter and return its new value.
 ///
 /// Increment happens before the read, so the value in the envelope is one the
@@ -321,7 +391,9 @@ pub fn quote(msg: &[u8], spec: &str, attest: &Path, sig: &Path) -> R<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{listing_has, parse_pcr_spec, same_ak};
+    use super::{
+        check_counter_attributes, listing_has, parse_nv_attributes, parse_pcr_spec, same_ak,
+    };
 
     fn fixture(name: &str) -> Vec<u8> {
         let p = format!(
@@ -329,6 +401,33 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         );
         std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}"))
+    }
+
+    #[test]
+    fn counter_without_orderly_is_accepted() {
+        // nt=counter|ownerread|ownerwrite|written, as nv_define creates it.
+        check_counter_attributes(0x2002_0012).unwrap();
+    }
+
+    #[test]
+    fn orderly_counter_is_refused() {
+        // The bench index after the orderly experiment.
+        let e = check_counter_attributes(0x2402_0012).unwrap_err();
+        assert!(e.contains("orderly"), "{e}");
+        check_counter_attributes(0x0402_0012).unwrap_err();
+    }
+
+    #[test]
+    fn non_counter_index_is_refused() {
+        // nt=ordinary.
+        check_counter_attributes(0x2002_0002).unwrap_err();
+    }
+
+    #[test]
+    fn attributes_value_is_taken_from_its_own_block() {
+        let out = "0x1500016:\n  name: 000b93\n  hash algorithm:\n    friendly: sha256\n    value: 0xB\n  attributes:\n    friendly: ownerwrite|nt=0x1|ownerread|orderly|written\n    value: 0x24020012\n  size: 8\n";
+        assert_eq!(parse_nv_attributes(out).unwrap(), 0x2402_0012);
+        parse_nv_attributes("0x1500016:\n  size: 8\n").unwrap_err();
     }
 
     #[test]

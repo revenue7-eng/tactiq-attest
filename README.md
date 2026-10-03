@@ -90,10 +90,11 @@ other, a routine provisioning desync would arrive at the verifier looking
 exactly like a forgery. The agent therefore refuses to run on a partial state
 rather than repairing it. See `prover/src/state.rs`.
 
-**The counter advances before the measurement is taken.** A crash in between
+**The counter value is taken before the measurement.** A crash in between
 burns a counter value, which is harmless, because the verifier requires
 strictly greater, not consecutive. The reverse order would let two envelopes
-describe different states under one counter value.
+describe different states under one counter value. The TPM counter itself
+advances once per agent start, as an epoch, not once per envelope (DDR-006).
 
 **The envelope is built by `attest-envelope`, never by hand.** Prover and
 verifier share one codec because it is one crate. Earlier design documents in
