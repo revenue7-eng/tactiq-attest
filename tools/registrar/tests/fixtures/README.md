@@ -41,3 +41,19 @@ for three years (leaves and Signing CA); the tests judge validity at
 - `record.json.rim.p7s`: the same by the RIM signer leaf under the same root.
 - `record.json.attrs.p7s`: without `-noattr` (signed attributes present).
 - `record.json.embedded.p7s`: with `-nodetach` (content embedded).
+
+## crl/
+
+A synthetic three-link chain (same TCG EK profile as `chain/`, from
+`chain/ca.cnf`) and CRLs made with `openssl ca -gencrl`, thisUpdate
+25 Sep 2026, nextUpdate 25 Oct 2026; the tests judge at 1 Oct 2026. The
+private keys were deleted after signing.
+
+- `root.der`, `int.der`, `ek.der`: the chain, 10 years from 25 Sep 2026.
+- `int-empty.crl`, `root-empty.crl`: current CRLs of the two CAs, no entries.
+- `int-revokes-ek.crl`: the issuing CA's CRL listing the EK certificate.
+- `root-revokes-int.crl`: the root's CRL listing the issuing CA.
+- `int-other-key.crl`: a CRL with the issuing CA's name, signed by another key.
+
+The real Infineon CRLs are not fixtures; see the ignored test
+`infineon_crls_from_env` in `src/crl.rs`.

@@ -10,3 +10,4 @@ tools/registrar/tests/fixtures/**/*.blob binary
 # Signature fixtures: a signature covers the record bytes exactly, so neither
 # the .p7s files nor the signed .json may be rewritten on checkout.
 tools/registrar/tests/fixtures/signature/** binary
+tools/registrar/tests/fixtures/**/*.crl binary
