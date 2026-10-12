@@ -148,8 +148,18 @@ C. The Infineon root was obtained through a browser and is not yet pinned by
    fingerprint it was checked against, and no external claim about the EK
    chain is made on the strength of the record alone.
 
-D. EK certificate revocation is not checked: the registrar is offline. The
-   record states that.
+D. Revocation. Amended 2026-10-12, record format `tactiq-ak-registration/2`:
+   the registrar checks the EK certificate against the CRL of its issuing CA
+   and the issuing CA against the CRL of the root, both current at the chain
+   check time, and carries both CRLs in the record with their own thisUpdate
+   and nextUpdate (`tools/registrar/src/crl.rs`). The registrar stays
+   offline: the CRLs are fetched beforehand from the distribution points the
+   certificates name and given as files. Not covered: OCSP, delta CRLs, and
+   revocation after the registration. Format 1 records (v2.1.0-rc13) did not
+   check revocation and said so. Format 2 also drops the record field
+   `signed`, which format 1 always wrote as `false` and which read as the
+   opposite of a record with a detached signature; the signature stays a
+   separate file.
 
 E. The protocol relies on the TPM refusing `TPM2_ActivateCredential` for an
    object loaded without its private part (`TPM2_LoadExternal`, public area

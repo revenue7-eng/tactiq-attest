@@ -11,11 +11,18 @@
 //!
 //! A record from this tool is unsigned: it is signed afterwards as a file by
 //! the `Registration Signer` leaf (decision 6), detached, and `verify --sig`
-//! checks that signature (`signature.rs`). The record's own `signed` field
-//! stays `false`; a signature is a separate file, never a field. An unsigned
-//! record is internal and never presented as L3.
+//! checks that signature (`signature.rs`). A signature is a separate file,
+//! never a field. An unsigned record is internal and never presented as L3.
+//!
+//! Record formats. `tactiq-ak-registration/2` (written by this tool) carries
+//! the CRLs of both CAs of the EK chain, checked at the chain check time
+//! (`crl.rs`), and has no `signed` field. `tactiq-ak-registration/1` (the
+//! records of v2.1.0-rc13) had `signed: false`, which read as the opposite of
+//! a record with a detached signature, and `revocation_checked: false`; it is
+//! still verified, by its own rules, and is no longer written.
 
 mod chain;
+mod crl;
 mod makecred;
 mod signature;
 
@@ -31,7 +38,8 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const RECORD_FORMAT: &str = "tactiq-ak-registration/1";
+const RECORD_FORMAT: &str = "tactiq-ak-registration/2";
+const RECORD_FORMAT_V1: &str = "tactiq-ak-registration/1";
 const PENDING_FORMAT: &str = "tactiq-ak-registration-pending/1";
 const EK_NV_INDEX: &str = "0x01C00002";
 const DEVICE_ID_MAX: usize = attest_envelope::DEVICE_ID_LEN;
@@ -56,12 +64,30 @@ struct Record {
     /// The chain check this tool performs; see `chain.rs`.
     chain_check: String,
     revocation_checked: bool,
+    /// Format 2: the revocation check (`crl.rs`) and the CRLs it used, DER as
+    /// hex, with their own thisUpdate and nextUpdate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revocation_check: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ek_crl: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ek_crl_this_update_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ek_crl_next_update_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intermediate_crl: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intermediate_crl_this_update_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intermediate_crl_next_update_utc: Option<String>,
     ak_public: String,
     ak_name: String,
     /// tpm2-tools credential file bytes.
     credential_blob: String,
     secret_sha256: String,
-    signed: bool,
+    /// Format 1 only, always false there; not written by this tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signed: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,6 +99,12 @@ struct Pending {
     ek_certificate: String,
     intermediate_certificate: String,
     root_sha256: String,
+    ek_crl: String,
+    ek_crl_this_update_unix: u64,
+    ek_crl_next_update_unix: u64,
+    intermediate_crl: String,
+    intermediate_crl_this_update_unix: u64,
+    intermediate_crl_next_update_unix: u64,
     ak_public: String,
     ak_name: String,
     credential_blob: String,
@@ -83,6 +115,11 @@ const CHAIN_CHECK: &str = "EK <- intermediate <- pinned root; sha256WithRSAEncry
      issuer/subject byte match; signatures; validity at chain_checked_utc; \
      CA flags and keyCertSign on both CAs; EK not a CA, EKU tcg-kp-EKCertificate; \
      unknown critical extensions refused";
+
+const REVOCATION_CHECK: &str = "EK certificate against the CRL of its issuing CA, issuing CA \
+     against the CRL of the root; sha256WithRSAEncryption by the issuing key with cRLSign; \
+     CRL issuer byte match; thisUpdate <= chain_checked_utc <= nextUpdate; \
+     no critical CRL extension; serial not listed";
 
 type R<T> = Result<T, String>;
 
@@ -97,6 +134,7 @@ fn main() {
                 "tactiq-registrar <command> [--option value ...]\n\n\
                  begin     --state DIR --device-id ID --ak-public FILE --ek-cert FILE\n\
                  \x20         --intermediate FILE --root FILE --registrar NAME\n\
+                 \x20         --ek-crl FILE --intermediate-crl FILE\n\
                  complete  --state DIR --answer FILE\n\
                  verify    --record FILE --root FILE [--emit-ak FILE]\n\
                  \x20         [--sig FILE.p7s --release-root FILE]"
@@ -201,9 +239,12 @@ fn cmd_begin(o: &Opts) -> R<()> {
     let int_der = read(o.get("intermediate")?)?;
     let root_der = read(o.get("root")?)?;
     let ak_public = read(o.get("ak-public")?)?;
+    let ek_crl = read(o.get("ek-crl")?)?;
+    let int_crl = read(o.get("intermediate-crl")?)?;
 
     let at = now();
     let chain = chain::verify(&ek_der, &int_der, &root_der, at)?;
+    let (ec, ic) = crl::check_chain(&ek_der, &int_der, &root_der, &ek_crl, &int_crl, at)?;
     let name = check_ak(&ak_public)?;
 
     let mut secret = [0u8; makecred::SECRET_LEN];
@@ -222,6 +263,12 @@ fn cmd_begin(o: &Opts) -> R<()> {
         ek_certificate: hex::encode(&ek_der),
         intermediate_certificate: hex::encode(&int_der),
         root_sha256: hex::encode(chain.root_sha256),
+        ek_crl: hex::encode(&ek_crl),
+        ek_crl_this_update_unix: ec.this_update_unix,
+        ek_crl_next_update_unix: ec.next_update_unix,
+        intermediate_crl: hex::encode(&int_crl),
+        intermediate_crl_this_update_unix: ic.this_update_unix,
+        intermediate_crl_next_update_unix: ic.next_update_unix,
         ak_public: hex::encode(&ak_public),
         ak_name: hex::encode(name),
         credential_blob: hex::encode(&blob),
@@ -233,6 +280,8 @@ fn cmd_begin(o: &Opts) -> R<()> {
 
     println!("device      {device_id}");
     println!("root sha256 {}", hex::encode(chain.root_sha256));
+    println!("revocation  EK not listed (CRL {} to {}), intermediate not listed (CRL {} to {})",
+        utc(ec.this_update_unix), utc(ec.next_update_unix), utc(ic.this_update_unix), utc(ic.next_update_unix));
     println!("ak name     {}", hex::encode(name));
     println!("blob        {} ({} bytes)", state.join("cred.blob").display(), blob.len());
     println!("blob sha256 {}", hex::encode(Sha256::digest(&blob)));
@@ -284,12 +333,19 @@ fn cmd_complete(o: &Opts) -> R<()> {
         intermediate_certificate: p.intermediate_certificate,
         root_sha256: p.root_sha256,
         chain_check: CHAIN_CHECK.into(),
-        revocation_checked: false,
+        revocation_checked: true,
+        revocation_check: Some(REVOCATION_CHECK.into()),
+        ek_crl: Some(p.ek_crl),
+        ek_crl_this_update_utc: Some(utc(p.ek_crl_this_update_unix)),
+        ek_crl_next_update_utc: Some(utc(p.ek_crl_next_update_unix)),
+        intermediate_crl: Some(p.intermediate_crl),
+        intermediate_crl_this_update_utc: Some(utc(p.intermediate_crl_this_update_unix)),
+        intermediate_crl_next_update_utc: Some(utc(p.intermediate_crl_next_update_unix)),
         ak_public: p.ak_public,
         ak_name: p.ak_name,
         credential_blob: p.credential_blob,
         secret_sha256: hex::encode(Sha256::digest(&secret)),
-        signed: false,
+        signed: None,
     };
     let mut json = serde_json::to_vec_pretty(&rec).map_err(|e| e.to_string())?;
     json.push(b'\n');
@@ -311,28 +367,53 @@ fn unhex(field: &str, v: &str) -> R<Vec<u8>> {
 fn cmd_verify(o: &Opts) -> R<()> {
     let record_bytes = read(o.get("record")?)?;
     let rec: Record = serde_json::from_slice(&record_bytes).map_err(|e| format!("record: {e}"))?;
-    if rec.format != RECORD_FORMAT {
-        return Err(format!("record format {}", rec.format));
-    }
-    if rec.signed {
-        return Err("record field `signed` is true; this tool writes false and checks a detached signature (--sig)".into());
+    let v2 = match rec.format.as_str() {
+        RECORD_FORMAT => true,
+        RECORD_FORMAT_V1 => false,
+        f => return Err(format!("record format {f}")),
+    };
+    if v2 {
+        if rec.signed.is_some() {
+            return Err("format 2 record carries a `signed` field; a signature is a separate file (--sig)".into());
+        }
+        if !rec.revocation_checked {
+            return Err("format 2 record without a revocation check".into());
+        }
+    } else {
+        if rec.signed != Some(false) {
+            return Err("format 1 record: field `signed` must be false; a signature is a separate file (--sig)".into());
+        }
+        if rec.revocation_checked {
+            return Err("format 1 record claims a revocation check format 1 never made".into());
+        }
     }
     validate_id(&rec.device_id)?;
-    if rec.revocation_checked {
-        return Err("record claims a revocation check this tool never makes".into());
-    }
 
     let root_der = read(o.get("root")?)?;
     let root_sha = hex::encode(Sha256::digest(&root_der));
     if root_sha != rec.root_sha256 {
         return Err(format!("root: sha256 {root_sha}, record names {}", rec.root_sha256));
     }
-    chain::verify(
-        &unhex("ek_certificate", &rec.ek_certificate)?,
-        &unhex("intermediate_certificate", &rec.intermediate_certificate)?,
-        &root_der,
-        Duration::from_secs(rec.chain_checked_unix),
-    )?;
+    let ek_der = unhex("ek_certificate", &rec.ek_certificate)?;
+    let int_der = unhex("intermediate_certificate", &rec.intermediate_certificate)?;
+    let at = Duration::from_secs(rec.chain_checked_unix);
+    chain::verify(&ek_der, &int_der, &root_der, at)?;
+    if v2 {
+        let need = |f: &str, v: &Option<String>| v.clone().ok_or_else(|| format!("format 2 record without {f}"));
+        let ek_crl = unhex("ek_crl", &need("ek_crl", &rec.ek_crl)?)?;
+        let int_crl = unhex("intermediate_crl", &need("intermediate_crl", &rec.intermediate_crl)?)?;
+        let (ec, ic) = crl::check_chain(&ek_der, &int_der, &root_der, &ek_crl, &int_crl, at)?;
+        for (f, got, want) in [
+            ("ek_crl_this_update_utc", &rec.ek_crl_this_update_utc, ec.this_update_unix),
+            ("ek_crl_next_update_utc", &rec.ek_crl_next_update_utc, ec.next_update_unix),
+            ("intermediate_crl_this_update_utc", &rec.intermediate_crl_this_update_utc, ic.this_update_unix),
+            ("intermediate_crl_next_update_utc", &rec.intermediate_crl_next_update_utc, ic.next_update_unix),
+        ] {
+            if got.as_deref() != Some(utc(want).as_str()) {
+                return Err(format!("record field {f} {:?} does not match the CRL ({})", got, utc(want)));
+            }
+        }
+    }
 
     let ak_public = unhex("ak_public", &rec.ak_public)?;
     let name = check_ak(&ak_public)?;
@@ -356,8 +437,13 @@ fn cmd_verify(o: &Opts) -> R<()> {
         _ => return Err("--sig and --release-root go together".into()),
     };
 
-    println!("record ok   {} (chain at {}, AK rule, AK name, blob layout)", rec.device_id, rec.chain_checked_utc);
-    println!("not checked: the blob contents (activate on the device), revocation, who registered");
+    if v2 {
+        println!("record ok   {} (format 2: chain and CRLs at {}, AK rule, AK name, blob layout)", rec.device_id, rec.chain_checked_utc);
+        println!("not checked: the blob contents (activate on the device), who registered");
+    } else {
+        println!("record ok   {} (format 1: chain at {}, AK rule, AK name, blob layout)", rec.device_id, rec.chain_checked_utc);
+        println!("not checked: the blob contents (activate on the device), revocation, who registered");
+    }
     match signer {
         Some(s) => {
             println!("signed      by {} (serial {})", s.leaf_subject, s.leaf_serial);
