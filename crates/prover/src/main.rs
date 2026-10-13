@@ -328,6 +328,12 @@ fn cmd_attest(
     ensure_dir(work)?;
     let out = PathBuf::from(out_dir);
     ensure_dir(&out)?;
+    let stale = remove_partials(&out)?;
+    if stale > 0 {
+        eprintln!(
+            "tactiq-agent: removed {stale} file(s) of an envelope whose writing was interrupted"
+        );
+    }
 
     let id = match state::inspect(paths) {
         Provisioning::Complete => state::read_id(paths)?,
@@ -362,18 +368,116 @@ fn cmd_attest(
     }
 
     let stem = format!("{counter:012}");
-    let msg_path = out.join(format!("{stem}.msg"));
-    let attest_path = out.join(format!("{stem}.attest"));
-    let sig_path = out.join(format!("{stem}.sig"));
-    fs::write(&msg_path, &msg).map_err(|e| format!("write {}: {e}", msg_path.display()))?;
-    tpm::quote(&msg, pcr_spec, &attest_path, &sig_path)?;
     // The tag file is what `custinel-verify` reads to decide the expected
     // disposition; a real emission always expects Accept.
-    fs::write(out.join(format!("{stem}.tag")), format!("{id} counter={counter}\n"))
-        .map_err(|e| format!("write tag: {e}"))?;
+    let tag = format!("{id} counter={counter}\n");
+    publish_envelope(&out, &stem, &msg, tag.as_bytes(), |attest, sig| {
+        tpm::quote(&msg, pcr_spec, attest, sig)
+    })?;
 
-    println!("attested {id} counter={counter} -> {}", msg_path.display());
+    println!(
+        "attested {id} counter={counter} -> {}",
+        out.join(format!("{stem}.msg")).display()
+    );
     Ok(counter)
+}
+
+/// Suffix of the files of an envelope that is still being written. Not one of
+/// the envelope extensions, so `stems_to_prune` and every reader ignore them.
+const PART: &str = "part";
+
+/// Write `data` to `path` and fsync the file.
+fn write_synced(path: &Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    f.write_all(data)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.sync_all()
+        .map_err(|e| format!("fsync {}: {e}", path.display()))
+}
+
+/// fsync a file another process wrote (tpm2_quote).
+fn sync_file(path: &Path) -> Result<(), String> {
+    fs::File::open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("fsync {}: {e}", path.display()))
+}
+
+/// Remove the `.part` files of envelopes whose writing was interrupted. They
+/// carry no evidence: the envelope was never published under its own name.
+fn remove_partials(out: &Path) -> Result<usize, String> {
+    let mut n = 0;
+    for e in fs::read_dir(out).map_err(|e| format!("read_dir {}: {e}", out.display()))? {
+        let e = e.map_err(|e| format!("read_dir {}: {e}", out.display()))?;
+        let name = match e.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let is_part = name
+            .strip_suffix(&format!(".{PART}"))
+            .and_then(|rest| rest.rsplit_once('.'))
+            .map(|(stem, ext)| {
+                matches!(ext, "msg" | "attest" | "sig" | "tag")
+                    && !stem.is_empty()
+                    && stem.bytes().all(|b| b.is_ascii_digit())
+            })
+            .unwrap_or(false);
+        if is_part {
+            let p = e.path();
+            fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Write one envelope so that a power cut leaves either the whole envelope or
+/// no file under the envelope's names.
+///
+/// Every file is written under a `.part` name and fsynced; then `.msg`,
+/// `.attest` and `.sig` are renamed into place, the directory is fsynced, and
+/// `.tag` is renamed last and the directory fsynced again. A file under an
+/// envelope name is therefore always complete, and an envelope with its `.tag`
+/// has all four. A cut between the renames leaves a complete envelope without
+/// its tag; a cut before them leaves only `.part` files, removed on the next
+/// cycle. `quote` writes the attestation and the signature to the two paths it
+/// is given.
+fn publish_envelope<F>(
+    out: &Path,
+    stem: &str,
+    msg: &[u8],
+    tag: &[u8],
+    quote: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path, &Path) -> Result<(), String>,
+{
+    let part = |ext: &str| out.join(format!("{stem}.{ext}.{PART}"));
+    let fin = |ext: &str| out.join(format!("{stem}.{ext}"));
+    let cleanup = || {
+        for ext in ["msg", "attest", "sig", "tag"] {
+            let _ = fs::remove_file(part(ext));
+        }
+    };
+    let staged = (|| {
+        write_synced(&part("msg"), msg)?;
+        quote(&part("attest"), &part("sig"))?;
+        sync_file(&part("attest"))?;
+        sync_file(&part("sig"))?;
+        write_synced(&part("tag"), tag)
+    })();
+    if let Err(e) = staged {
+        cleanup();
+        return Err(e);
+    }
+    for ext in ["msg", "attest", "sig"] {
+        fs::rename(part(ext), fin(ext))
+            .map_err(|e| format!("rename {}: {e}", fin(ext).display()))?;
+    }
+    state::sync_dir(out)?;
+    fs::rename(part("tag"), fin("tag"))
+        .map_err(|e| format!("rename {}: {e}", fin("tag").display()))?;
+    state::sync_dir(out)
 }
 
 /// Notify systemd. Written by hand rather than pulling a crate in: it is one
@@ -443,6 +547,78 @@ fn cmd_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("prover-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn listing(d: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn publish_writes_all_four_and_no_part_files() {
+        let d = tmpdir("publish-ok");
+        publish_envelope(&d, "000000000007", b"msg", b"tag\n", |a, s| {
+            fs::write(a, b"attest").unwrap();
+            fs::write(s, b"sig").unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            listing(&d),
+            vec![
+                "000000000007.attest",
+                "000000000007.msg",
+                "000000000007.sig",
+                "000000000007.tag"
+            ]
+        );
+        assert_eq!(fs::read(d.join("000000000007.attest")).unwrap(), b"attest");
+        assert_eq!(fs::read(d.join("000000000007.tag")).unwrap(), b"tag\n");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn failed_quote_leaves_no_file_of_the_envelope() {
+        let d = tmpdir("publish-fail");
+        let r = publish_envelope(&d, "000000000008", b"msg", b"tag\n", |a, _s| {
+            fs::write(a, b"half").unwrap();
+            Err("tpm2_quote failed".into())
+        });
+        assert!(r.is_err());
+        assert!(listing(&d).is_empty(), "{:?}", listing(&d));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn interrupted_envelope_is_invisible_and_removed_next_cycle() {
+        let d = tmpdir("partials");
+        // what a power cut during writing leaves: files under .part names,
+        // some of them empty
+        for n in [
+            "000000000009.msg.part",
+            "000000000009.attest.part",
+            "000000000009.sig.part",
+        ] {
+            fs::write(d.join(n), b"").unwrap();
+        }
+        fs::write(d.join("000000000005.msg"), b"m").unwrap();
+        fs::write(d.join("notes.part"), b"x").unwrap();
+        // the pruner does not see them as envelopes
+        assert!(stems_to_prune(&listing(&d), 0) == vec!["000000000005".to_string()]);
+        assert_eq!(remove_partials(&d).unwrap(), 3);
+        assert_eq!(listing(&d), vec!["000000000005.msg", "notes.part"]);
+        fs::remove_dir_all(&d).unwrap();
+    }
 
     /// The default selection must encode to the exact bytes the envelope has
     /// always carried (sha256 = 0x000B, PCRs 0..7 = ff 00 00), so this fix
