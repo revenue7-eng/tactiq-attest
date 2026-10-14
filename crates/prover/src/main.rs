@@ -216,6 +216,7 @@ fn main() {
                  \n\
                  env: TACTIQ_KEYS_DIR TACTIQ_OUT_DIR TACTIQ_WORK_DIR\n\
                       TACTIQ_PCR_SPEC TACTIQ_INTERVAL_SECS TACTIQ_AUDIT_KEEP\n\
+                      TACTIQ_BOOT_LOG\n\
                    TACTIQ_OWNER_AUTH_FILE TACTIQ_AK_HANDLE TACTIQ_NV_INDEX"
             );
             std::process::exit(2);
@@ -480,6 +481,74 @@ where
     state::sync_dir(out)
 }
 
+/// Where the kernel publishes the boot event log the loader wrote (TCG2,
+/// crypto-agile). On the Rock 5A the device tree names the area
+/// (tactiq-os 0005-arm64-dts-rk3588s-rock-5a-expose-tpm-event-log.patch).
+const DEFAULT_BOOT_LOG: &str = "/sys/kernel/security/tpm0/binary_bios_measurements";
+/// The loader's log area is 64 KiB; anything far larger is not that log.
+const BOOT_LOG_MAX: u64 = 1 << 20;
+
+/// Copy the boot event log into the audit directory as
+/// `boot-<sha256 of the log>.bios.log`.
+///
+/// The log is not part of any envelope and the agent does not sign it: it
+/// needs no signature of its own. Its SHA-256 bank replays to the PCR values
+/// that every quote of the same boot signs, so a verifier holding a quote can
+/// check the log against it, and the log of a different boot does not replay.
+/// Naming the file by its content makes the save idempotent: a restart of the
+/// agent within one boot finds the file in place, and two boots that measured
+/// exactly the same chain share one file, which is correct because their logs
+/// are identical. No boot identifier is read, so the agent needs no access to
+/// kernel sysctls for this.
+///
+/// Returns the path written, or None when there is nothing to do: the same
+/// log is already saved, or the platform publishes none. Failures are
+/// reported to the caller, which must not stop attesting because of them.
+fn save_boot_log(out: &Path, src: &Path) -> Result<Option<PathBuf>, String> {
+    use std::io::Read;
+    // A save cut short leaves only a part file; it carries nothing.
+    for e in fs::read_dir(out).map_err(|e| format!("read_dir {}: {e}", out.display()))? {
+        let e = e.map_err(|e| format!("read_dir {}: {e}", out.display()))?;
+        if let Ok(n) = e.file_name().into_string() {
+            if n.starts_with("boot-") && n.ends_with(&format!(".bios.log.{PART}")) {
+                let p = e.path();
+                fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))?;
+            }
+        }
+    }
+    let f = match fs::File::open(src) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("open {}: {e}", src.display())),
+    };
+    let mut data = Vec::new();
+    f.take(BOOT_LOG_MAX + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| format!("read {}: {e}", src.display()))?;
+    if data.len() as u64 > BOOT_LOG_MAX {
+        return Err(format!("{} is larger than {BOOT_LOG_MAX} bytes", src.display()));
+    }
+    if data.is_empty() {
+        return Ok(None);
+    }
+    // evidence_digest is plain SHA-256 over the bytes; it is reused here so the
+    // agent keeps its single dependency.
+    let hex: String = attest_envelope::evidence_digest(&data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let name = format!("boot-{hex}.bios.log");
+    let dst = out.join(&name);
+    if dst.exists() {
+        return Ok(None);
+    }
+    let tmp = out.join(format!("{name}.{PART}"));
+    write_synced(&tmp, &data)?;
+    fs::rename(&tmp, &dst).map_err(|e| format!("rename {}: {e}", dst.display()))?;
+    state::sync_dir(out)?;
+    Ok(Some(dst))
+}
+
 /// Notify systemd. Written by hand rather than pulling a crate in: it is one
 /// datagram, and the agent is TCB code where every dependency is a liability.
 ///
@@ -521,6 +590,15 @@ fn cmd_run(
 
     let mut alloc = CounterAlloc::new();
     let out = PathBuf::from(out_dir);
+    ensure_dir(&out)?;
+    // Best effort: a missing or unreadable boot log costs the verifier the log
+    // route for this boot, not the envelopes, so it never stops the agent.
+    let src = PathBuf::from(env_or("TACTIQ_BOOT_LOG", DEFAULT_BOOT_LOG));
+    match save_boot_log(&out, &src) {
+        Ok(Some(p)) => eprintln!("tactiq-agent: boot event log saved as {}", p.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("tactiq-agent: boot event log not saved: {e}"),
+    }
     sd_notify("READY=1");
     loop {
         let started = Instant::now();
@@ -716,5 +794,67 @@ mod tests {
     fn default_spec_encodes_to_historical_selection_bytes() {
         let (alg_id, bitmap) = tpm::parse_pcr_spec(DEFAULT_PCR_SPEC).unwrap();
         assert_eq!(encode_pcr_selection(alg_id, bitmap), [0x00, 0x0B, 0xff, 0x00, 0x00]);
+    }
+
+    fn boot_setup(name: &str, log: Option<&[u8]>) -> (PathBuf, PathBuf) {
+        let d = tmpdir(name);
+        let out = d.join("audit");
+        fs::create_dir_all(&out).unwrap();
+        let src = d.join("binary_bios_measurements");
+        if let Some(b) = log {
+            fs::write(&src, b).unwrap();
+        }
+        (out, src)
+    }
+
+    fn boot_name(log: &[u8]) -> String {
+        let hex: String = attest_envelope::evidence_digest(log)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("boot-{hex}.bios.log")
+    }
+
+    #[test]
+    fn boot_log_saved_under_its_digest_once() {
+        let (out, src) = boot_setup("bootlog-once", Some(b"log of boot A"));
+        let p = save_boot_log(&out, &src).unwrap().expect("first save writes");
+        assert_eq!(p.file_name().unwrap().to_str().unwrap(), boot_name(b"log of boot A"));
+        assert_eq!(fs::read(&p).unwrap(), b"log of boot A");
+        assert!(save_boot_log(&out, &src).unwrap().is_none(), "same log: no second copy");
+        fs::write(&src, b"log of boot B").unwrap();
+        assert!(save_boot_log(&out, &src).unwrap().is_some(), "other log: new file");
+        assert_eq!(listing(&out).len(), 2);
+    }
+
+    #[test]
+    fn boot_log_absent_or_empty_is_not_an_error() {
+        let (out, src) = boot_setup("bootlog-absent", None);
+        assert!(save_boot_log(&out, &src).unwrap().is_none());
+        fs::write(&src, b"").unwrap();
+        assert!(save_boot_log(&out, &src).unwrap().is_none());
+        assert!(listing(&out).is_empty(), "{:?}", listing(&out));
+    }
+
+    #[test]
+    fn boot_log_refuses_oversize() {
+        let (out, src) = boot_setup("bootlog-big", Some(&vec![0u8; (BOOT_LOG_MAX + 1) as usize]));
+        assert!(save_boot_log(&out, &src).is_err());
+        assert!(listing(&out).is_empty(), "{:?}", listing(&out));
+    }
+
+    #[test]
+    fn boot_log_removes_stale_part_and_leaves_envelopes() {
+        let (out, src) = boot_setup("bootlog-part", Some(b"log"));
+        let stale = format!("{}.{PART}", boot_name(b"older log"));
+        fs::write(out.join(&stale), b"half").unwrap();
+        fs::write(out.join("000000000005.msg"), b"m").unwrap();
+        save_boot_log(&out, &src).unwrap();
+        let names = listing(&out);
+        assert!(!names.contains(&stale), "{names:?}");
+        assert!(names.contains(&"000000000005.msg".to_string()));
+        assert!(names.contains(&boot_name(b"log")));
+        // The envelope pruner never touches the boot log.
+        assert_eq!(stems_to_prune(&names, 0), vec!["000000000005".to_string()]);
     }
 }
