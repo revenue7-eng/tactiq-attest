@@ -1,4 +1,4 @@
-//! TPM access for the prover.
+//! TPM access for the TactiQ device binaries (the prover today).
 //!
 //! This layer shells out to tpm2-tools. That is a deliberate Phase 0 choice,
 //! not the end state:
