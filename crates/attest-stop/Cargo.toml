@@ -10,6 +10,9 @@ publish = false
 name = "attest_stop"
 path = "src/lib.rs"
 
-# No dependencies, on purpose: std only. Built into the device service and into
-# whatever checks it, including a browser, like attest-appraise.
+# One dependency, sha2, for the digests both sides must compute the same way
+# (request digest, certify qualifying data). Pure computation, builds for
+# wasm32: this crate goes into the device service and into whatever checks it,
+# including a browser, like attest-appraise.
 [dependencies]
+sha2 = "0.10"

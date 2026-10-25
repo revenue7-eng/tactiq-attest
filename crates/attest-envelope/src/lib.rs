@@ -228,7 +228,8 @@ pub fn build_canonical(
 //     0x0003            CPU TEE report
 //     0x0004            agent stop state (body: crate `attest-stop`)
 //     0x0005            verifier nonce (body: crate `attest-stop`)
-//     0x0006..=0xFEFF   unassigned, public registry
+//     0x0006            TPM NV certify (body: crate `attest-stop`)
+//     0x0007..=0xFEFF   unassigned, public registry
 //     0xFF00..=0xFFFE   private / experimental, never publicly registered
 //     0xFFFF            forbidden, never assigned
 //
@@ -262,6 +263,10 @@ pub const TAG_STOP_STATE: u16 = 0x0004;
 /// A challenge chosen by the party checking the device. Carried in the bundle
 /// so that `evidence_hash`, and through it the TPM quote, commits to it.
 pub const TAG_VERIFIER_NONCE: u16 = 0x0005;
+/// A `TPM2_NV_Certify` result: the TPM's own signed statement of an NV
+/// index's contents. The stop service uses it for its counter, so the stop
+/// epoch in a record is vouched for by the TPM rather than by the service.
+pub const TAG_TPM_NV_CERTIFY: u16 = 0x0006;
 /// Private/experimental range, inclusive. Never publicly registered.
 pub const TAG_PRIVATE_MIN: u16 = 0xFF00;
 pub const TAG_PRIVATE_MAX: u16 = 0xFFFE;
@@ -453,6 +458,7 @@ mod tests {
         // only because both read them from here.
         assert_eq!(TAG_STOP_STATE, 0x0004);
         assert_eq!(TAG_VERIFIER_NONCE, 0x0005);
+        assert_eq!(TAG_TPM_NV_CERTIFY, 0x0006);
         assert!(!tag_forbidden(TAG_STOP_STATE) && !tag_forbidden(TAG_VERIFIER_NONCE));
         assert!(TAG_VERIFIER_NONCE < TAG_PRIVATE_MIN);
     }
@@ -461,11 +467,11 @@ mod tests {
     fn unknown_tags_parse_as_sections() {
         // Boundary B: extensible by construction. Unknown-to-us is not
         // malformed; public-unassigned and private ranges both parse.
-        // 0x0006 is the first public tag still unassigned (0x0004 and 0x0005
+        // 0x0007 is the first public tag still unassigned (0x0004 to 0x0006
         // were assigned to the stop service); keep this test on a free value.
-        let b = build_bundle(&[(0x0006, b"x".as_slice()), (TAG_PRIVATE_MIN, b"y".as_slice())]).unwrap();
+        let b = build_bundle(&[(0x0007, b"x".as_slice()), (TAG_PRIVATE_MIN, b"y".as_slice())]).unwrap();
         let s = parse_bundle(&b).unwrap();
-        assert_eq!(s[0].tag, 0x0006);
+        assert_eq!(s[0].tag, 0x0007);
         assert_eq!(s[1].tag, TAG_PRIVATE_MIN);
     }
 

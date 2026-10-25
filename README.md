@@ -29,16 +29,18 @@ a minimum.
 | Crate | What it does |
 |---|---|
 | `attest-envelope` | The wire format: the signed message, and the tag/len container for the evidence bundle it commits to. Parse, build, encode the PCR selection. No state, no I/O, no trust decision. |
-| `attest-stop` | Body of the stop service's two evidence sections: the stop record (tag `0x0004`) and the verifier nonce (tag `0x0005`). Parse and build, exact lengths, no state. |
+| `attest-stop` | Formats of the stop service: the stop record (tag `0x0004`), the verifier nonce (`0x0005`), the NV certify section (`0x0006`) with a parser for the TPM's `TPM_ST_ATTEST_NV` structure, and the receipt container. Parse, build and check, exact lengths, no state. |
 | `attest-tpm` | Every TPM call the device binaries make, in one crate. Shells out to `tpm2-tools` today. |
 | `prover` | `tactiq-agent`: provisions an identity, then produces one signed envelope per cycle. |
+| `stop` | `tactiq-stop`: the agent stop service. Answers agentgateway's `extAuthz` before every tool call; the stop state is the parity of a TPM NV counter, and every refusal carries a receipt with the AK quote over the boot PCRs and the TPM's own `NV_Certify` of that counter, checked on the device before it is handed out. Not yet closed: the counter is owner-writable (empty owner auth on TactiQ OS), the AK is shared with the agent, and a release image has no operator channel. See the service's own documentation. |
 
 ## The evidence bundle
 
 `evidence_hash` is SHA-256 over a bundle of sections, each framed as
 `tag(u16, big-endian) || len(u32, big-endian) || body`. Assigned tags are
 `0x0001` TPM quote, `0x0002` GPU attestation, `0x0003` CPU TEE, `0x0004` agent
-stop state and `0x0005` verifier nonce (bodies defined in `attest-stop`), with
+stop state, `0x0005` verifier nonce and `0x0006` TPM NV certify (bodies
+defined in `attest-stop`), with
 `0xFF00`-`0xFFFE` reserved for private use.
 
 Four properties of that container are load-bearing rather than stylistic:

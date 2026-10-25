@@ -44,6 +44,32 @@ pub const DEFAULT_AK_HANDLE: &str = "0x81010100";
 /// is handed out twice across restarts, and one increment per start gives that.
 pub const DEFAULT_NV_COUNTER: &str = "0x1500016";
 
+/// NV index of the agent stop counter used by `tactiq-stop`.
+///
+/// A separate index from the agent's epoch counter: that one counts agent
+/// starts (DDR-006), this one counts stop and recovery transitions, and the
+/// stop state is its parity (odd = stopped). Mixing the two would let an
+/// agent restart flip the stop state.
+///
+/// Defined `authread`, so it is read and certified with the index's own empty
+/// auth and the reader needs no owner authorization; writes stay with the
+/// owner hierarchy.
+///
+/// Fixed, not configurable: the service and the operator commands are
+/// separate processes, and an environment variable that differed between
+/// them would let `trip` advance one index while the service reads another.
+pub const STOP_NV_COUNTER: &str = "0x1500017";
+
+/// The exact attribute set of the stop counter, ignoring TPMA_NV_WRITTEN:
+/// counter type, owner write, owner read, auth read. Anything else (orderly,
+/// policy write, no-DA, platform-created, ...) is a different index than the
+/// one this code was written for, and is refused.
+pub const STOP_NV_ATTRIBUTES: u32 = TPM_NT_COUNTER | TPMA_NV_OWNERWRITE | TPMA_NV_OWNERREAD | TPMA_NV_AUTHREAD;
+const TPMA_NV_OWNERWRITE: u32 = 1 << 1;
+const TPMA_NV_OWNERREAD: u32 = 1 << 17;
+const TPMA_NV_AUTHREAD: u32 = 1 << 18;
+const TPMA_NV_WRITTEN: u32 = 1 << 29;
+
 /// Persistent handle of the AK: `TACTIQ_AK_HANDLE`, default
 /// `DEFAULT_AK_HANDLE`. A host TPM may already use the default for something
 /// else (another agent, a vendor tool); the handle is configurable so the
@@ -372,6 +398,116 @@ pub fn nv_increment_and_read(work: &Path) -> R<u64> {
     Ok(u64::from_be_bytes(b))
 }
 
+/// Define the stop counter: a non-orderly counter, written by the owner,
+/// read with its own (empty) auth. The first increment makes it readable.
+/// Its value after that is chosen by the TPM (the highest value any counter
+/// on this TPM has held), so its parity, and with it the initial stop state,
+/// is not known in advance: the caller reads it and sets the state it wants.
+pub fn stop_nv_define() -> R<()> {
+    run_owner(&[
+        "tpm2_nvdefine", STOP_NV_COUNTER, "-C", "o",
+        "-a", "nt=counter|ownerwrite|ownerread|authread",
+    ])?;
+    stop_nv_first_write()
+}
+
+/// Check the stop counter's attributes against `STOP_NV_ATTRIBUTES`.
+pub fn check_stop_attributes(attrs: u32) -> R<()> {
+    if attrs & !TPMA_NV_WRITTEN != STOP_NV_ATTRIBUTES {
+        return Err(format!(
+            "{STOP_NV_COUNTER} has attributes 0x{attrs:08x}; the stop counter must be exactly \
+             0x{STOP_NV_ATTRIBUTES:08x} (counter, ownerwrite, ownerread, authread), plus written"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a stop counter that is not exactly the index this code expects.
+pub fn verify_stop_counter() -> R<()> {
+    check_stop_attributes(stop_nv_attributes()?)
+}
+
+/// The stop counter's attribute word as the TPM reports it.
+pub fn stop_nv_attributes() -> R<u32> {
+    let o = run(&["tpm2_nvreadpublic", STOP_NV_COUNTER])?;
+    parse_nv_attributes(&String::from_utf8_lossy(&o))
+}
+
+/// Whether the stop counter has been written (incremented) at least once.
+/// A counter that was defined but never incremented cannot be read.
+pub fn stop_attributes_written(attrs: u32) -> bool {
+    attrs & TPMA_NV_WRITTEN != 0
+}
+
+/// First increment of a defined but never written stop counter.
+pub fn stop_nv_first_write() -> R<()> {
+    run_owner(&["tpm2_nvincrement", STOP_NV_COUNTER, "-C", "o"])?;
+    Ok(())
+}
+
+/// The TPM name of the stop counter (nameAlg || digest of its public area),
+/// as `tpm2_nvreadpublic` reports it. A certify names the index it read by
+/// this value, so comparing the two catches a certify of some other index.
+pub fn stop_nv_name() -> R<Vec<u8>> {
+    let o = run(&["tpm2_nvreadpublic", STOP_NV_COUNTER])?;
+    parse_nv_name(&String::from_utf8_lossy(&o))
+}
+
+/// The `name:` line of `tpm2_nvreadpublic` output, hex-decoded.
+pub fn parse_nv_name(listing: &str) -> R<Vec<u8>> {
+    let hex = listing
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("name:"))
+        .map(str::trim)
+        .ok_or("no name line in tpm2_nvreadpublic output")?;
+    if hex.is_empty() || hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("name is not hex: {hex:?}"));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Read the stop counter with the index's own auth. The value comes from the
+/// tool's standard output, not from a file: a file in a shared directory can
+/// be overwritten between the tool writing it and this process reading it.
+pub fn stop_nv_read() -> R<u64> {
+    let raw = run(&["tpm2_nvread", STOP_NV_COUNTER, "-C", STOP_NV_COUNTER, "--size", "8"])?;
+    if raw.len() != 8 {
+        return Err(format!("stop counter read returned {} bytes, expected 8", raw.len()));
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&raw);
+    Ok(u64::from_be_bytes(b))
+}
+
+/// Advance the stop counter by one. Owner-authorized.
+pub fn stop_nv_increment() -> R<()> {
+    run_owner(&["tpm2_nvincrement", STOP_NV_COUNTER, "-C", "o"])?;
+    Ok(())
+}
+
+/// Have the TPM itself sign the stop counter's current value with the AK.
+///
+/// `TPM2_NV_Certify` reads the index inside the TPM and returns a
+/// `TPMS_ATTEST` of type `TPM_ST_ATTEST_NV` carrying the index name, the
+/// offset and the bytes read, with `extraData = qualifying`. The value a
+/// verifier sees is therefore the TPM's, not whatever the caller claims.
+/// `attest` and `sig` should be in a directory private to the caller.
+pub fn stop_nv_certify(qualifying: &[u8; 32], attest: &Path, sig: &Path) -> R<()> {
+    let nv = STOP_NV_COUNTER;
+    let hex: String = qualifying.iter().map(|b| format!("{b:02x}")).collect();
+    let (a, s) = (attest.to_string_lossy().to_string(), sig.to_string_lossy().to_string());
+    let h = ak_handle()?;
+    run(&[
+        "tpm2_nvcertify", "-C", &h, "-c", nv, "-g", "sha256", "-s", "ecdsa", "-f", "plain",
+        "-q", &hex, "--size", "8", "--offset", "0", "--attestation", &a, "-o", &s, nv,
+    ])?;
+    Ok(())
+}
+
 /// Read the selected PCRs, returning the raw concatenated bank contents.
 /// `spec` is a tpm2-tools selection string such as `sha256:0,1,2,3,4,5,6,7`.
 ///
@@ -453,6 +589,13 @@ pub fn parse_pcr_spec(spec: &str) -> R<(u16, [u8; 3])> {
 /// path used (the verifier accepts DER or r||s).
 pub fn quote(msg: &[u8], spec: &str, attest: &Path, sig: &Path) -> R<()> {
     let qd = attest_envelope::tpm::qualifying_data(msg)?;
+    quote_qualified(&qd, spec, attest, sig)
+}
+
+/// Quote with qualifying data the caller computed. For a quote that must not
+/// be mistaken for an agent envelope's (the stop service uses its own
+/// domain-separated digest of the message).
+pub fn quote_qualified(qd: &[u8], spec: &str, attest: &Path, sig: &Path) -> R<()> {
     let hex: String = qd.iter().map(|b| format!("{b:02x}")).collect();
     let (a, s) = (attest.to_string_lossy().to_string(), sig.to_string_lossy().to_string());
     let h = ak_handle()?;
@@ -605,5 +748,35 @@ mod tests {
         assert!(parse_pcr_spec("sha256:").is_err());
         assert!(parse_pcr_spec("sha256:0,,1").is_err());
         assert!(parse_pcr_spec("sha256:0,").is_err());
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    #[test]
+    fn stop_counter_is_not_the_agent_counter() {
+        assert_ne!(STOP_NV_COUNTER, DEFAULT_NV_COUNTER);
+        assert_eq!(parse_handle(STOP_NV_COUNTER, 0x0100_0000, 0x01FF_FFFF).unwrap(), STOP_NV_COUNTER);
+    }
+
+    #[test]
+    fn stop_attributes_must_match_exactly() {
+        assert_eq!(STOP_NV_ATTRIBUTES, 0x0006_0012);
+        assert!(check_stop_attributes(STOP_NV_ATTRIBUTES).is_ok());
+        assert!(check_stop_attributes(STOP_NV_ATTRIBUTES | TPMA_NV_WRITTEN).is_ok());
+        assert!(check_stop_attributes(STOP_NV_ATTRIBUTES | TPMA_NV_ORDERLY).is_err());
+        assert!(check_stop_attributes(STOP_NV_ATTRIBUTES | (1 << 25)).is_err(), "no_da");
+        assert!(check_stop_attributes(STOP_NV_ATTRIBUTES & !TPMA_NV_AUTHREAD).is_err());
+        assert!(check_stop_attributes(0).is_err());
+    }
+
+    #[test]
+    fn nv_name_is_taken_from_its_line() {
+        let l = "0x1500017:\n  name: 000b0102ab\n  hash algorithm:\n    friendly: sha256\n    value: 0xB\n";
+        assert_eq!(parse_nv_name(l).unwrap(), vec![0x00, 0x0b, 0x01, 0x02, 0xab]);
+        assert!(parse_nv_name("0x1500017:\n  name: 0g\n").is_err());
+        assert!(parse_nv_name("0x1500017:\n").is_err());
     }
 }
