@@ -29,6 +29,7 @@ a minimum.
 | Crate | What it does |
 |---|---|
 | `attest-envelope` | The wire format: the signed message, and the tag/len container for the evidence bundle it commits to. Parse, build, encode the PCR selection. No state, no I/O, no trust decision. |
+| `attest-tpm` | Every TPM call the device binaries make, in one crate. Shells out to `tpm2-tools` today. |
 | `prover` | `tactiq-agent`: provisions an identity, then produces one signed envelope per cycle. |
 
 ## The evidence bundle
@@ -80,7 +81,7 @@ silence, indistinguishable from a device that is powered off, instead of a
 signed attestation of a state it does not recognise. The verifier draws a hard
 line between "attested something we have not enrolled" and "signature did not
 verify", and quarantines on one while alarming on the other. A sealed signing
-key collapses that distinction. See `prover/src/tpm.rs`.
+key collapses that distinction. See `attest-tpm/src/lib.rs`.
 
 **Identity and key live and die together.** The device id sits next to the
 public key in `/data/tactiq/keys`, not in the image: the same image is flashed
@@ -104,14 +105,14 @@ codec makes that class of drift impossible rather than merely unlikely.
 
 ## TPM access
 
-`prover/src/tpm.rs` shells out to `tpm2-tools`. This is a deliberate first
+`attest-tpm` shells out to `tpm2-tools`. This is a deliberate first
 step, not the end state: the command sequence matches the harness that
 validated the protocol, and it behaves identically against swtpm and a discrete
 chip, so the agent could be finished before hardware arrived.
 
 Consequence to be aware of: while this is in use, an image shipping the agent
 needs `tpm2-tools`, not just the `libtss2` runtime. Every TPM call lives in that
-one file so that swapping to `tss-esapi`, which removes the dependency, touches
+one crate so that swapping to `tss-esapi`, which removes the dependency, touches
 nothing else.
 
 ## Building

@@ -1,0 +1,19 @@
+[package]
+name = "attest-tpm"
+version = "0.1.0"
+edition.workspace = true
+description = "TPM access shared by the TactiQ device binaries (tpm2-tools today, tss-esapi later)"
+license.workspace = true
+publish = false
+
+[lib]
+name = "attest_tpm"
+path = "src/lib.rs"
+
+# One dependency, in this workspace: the envelope crate, for the AK public
+# area parser and the quote's qualifying data, so that what the TPM is asked
+# to sign is computed by the same code the verifier uses. Every TPM call of
+# every device binary lives in this crate, so that replacing tpm2-tools with
+# tss-esapi touches one place.
+[dependencies]
+attest-envelope = { path = "../attest-envelope" }

@@ -27,10 +27,12 @@
 //! every use it compares the object's name with the AK public area recorded at
 //! provisioning (`keys/ak.pub`), and refuses on any difference.
 //!
-//! Everything TPM-facing is in `tpm.rs`; everything disk-facing is in `state.rs`.
+//! Everything TPM-facing is in the `attest-tpm` crate; everything disk-facing
+//! is in `state.rs`.
 
 mod state;
-mod tpm;
+
+use attest_tpm as tpm;
 
 use std::fs;
 use std::path::{Path, PathBuf};

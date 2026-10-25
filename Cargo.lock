@@ -21,6 +21,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "attest-tpm"
+version = "0.1.0"
+dependencies = [
+ "attest-envelope",
+]
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -271,6 +278,7 @@ name = "prover"
 version = "0.3.0"
 dependencies = [
  "attest-envelope",
+ "attest-tpm",
 ]
 
 [[package]]

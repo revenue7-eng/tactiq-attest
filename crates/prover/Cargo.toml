@@ -11,8 +11,11 @@ name = "tactiq-agent"
 path = "src/main.rs"
 
 [dependencies]
-# The only dependency, on purpose. It is the envelope crate, not attest-core:
-# the agent needs the wire format and nothing else, so it never links the
-# verifier, the trust store, or the durable high-water mark. Sharing this one
-# crate is what makes prover/verifier format drift impossible.
+# Two dependencies, both in this workspace, on purpose. The envelope crate, not
+# attest-core: the agent needs the wire format and nothing else, so it never
+# links the verifier, the trust store, or the durable high-water mark. Sharing
+# this one crate is what makes prover/verifier format drift impossible.
 attest-envelope = { path = "../attest-envelope" }
+# TPM access. It lives in its own crate so that every device binary goes
+# through the same, single set of TPM calls.
+attest-tpm = { path = "../attest-tpm" }
