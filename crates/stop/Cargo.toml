@@ -1,0 +1,19 @@
+[package]
+name = "stop"
+version = "0.1.0"
+edition.workspace = true
+description = "tactiq-stop: the agent stop service, answering agentgateway's extAuthz with TPM-signed receipts"
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "tactiq-stop"
+path = "src/main.rs"
+
+# Workspace crates plus sha2, which the envelope already brings in: no async
+# runtime, no HTTP framework, no serialisation library in the service.
+[dependencies]
+attest-envelope = { path = "../attest-envelope" }
+attest-stop = { path = "../attest-stop" }
+attest-tpm = { path = "../attest-tpm" }
+sha2 = "0.10"

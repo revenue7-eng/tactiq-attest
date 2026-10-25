@@ -44,6 +44,18 @@ pub const DEFAULT_AK_HANDLE: &str = "0x81010100";
 /// is handed out twice across restarts, and one increment per start gives that.
 pub const DEFAULT_NV_COUNTER: &str = "0x1500016";
 
+/// NV index of the agent stop counter used by `tactiq-stop`.
+///
+/// A separate index from the agent's epoch counter: that one counts agent
+/// starts (DDR-006), this one counts stop and recovery transitions, and the
+/// stop state is its parity (odd = stopped). Mixing the two would let an
+/// agent restart flip the stop state.
+///
+/// Defined `authread`, so it is read and certified with the index's own empty
+/// auth and the reader needs no owner authorization; writes stay with the
+/// owner hierarchy.
+pub const DEFAULT_STOP_NV_COUNTER: &str = "0x1500017";
+
 /// Persistent handle of the AK: `TACTIQ_AK_HANDLE`, default
 /// `DEFAULT_AK_HANDLE`. A host TPM may already use the default for something
 /// else (another agent, a vendor tool); the handle is configurable so the
@@ -56,6 +68,24 @@ pub fn ak_handle() -> R<String> {
 /// `DEFAULT_NV_COUNTER`. Must be an NV index (0x01xxxxxx).
 pub fn nv_counter() -> R<String> {
     handle_from_env("TACTIQ_NV_INDEX", DEFAULT_NV_COUNTER, 0x0100_0000, 0x01FF_FFFF)
+}
+
+/// NV index of the stop counter: `TACTIQ_STOP_NV_INDEX`, default
+/// `DEFAULT_STOP_NV_COUNTER`. Must be an NV index and must differ from the
+/// agent's epoch counter.
+pub fn stop_nv_counter() -> R<String> {
+    let stop = handle_from_env(
+        "TACTIQ_STOP_NV_INDEX",
+        DEFAULT_STOP_NV_COUNTER,
+        0x0100_0000,
+        0x01FF_FFFF,
+    )?;
+    if stop == nv_counter()? {
+        return Err(format!(
+            "stop counter {stop} is the agent's epoch counter; they must be separate indices"
+        ));
+    }
+    Ok(stop)
 }
 
 fn handle_from_env(key: &str, default: &str, lo: u32, hi: u32) -> R<String> {
@@ -370,6 +400,76 @@ pub fn nv_increment_and_read(work: &Path) -> R<u64> {
     let mut b = [0u8; 8];
     b.copy_from_slice(&raw);
     Ok(u64::from_be_bytes(b))
+}
+
+/// Define the stop counter: a non-orderly counter, written by the owner,
+/// read with its own (empty) auth. First increment makes it readable and
+/// leaves it at an even value only if the TPM started it at an odd one, so
+/// callers read the value afterwards rather than assume it.
+pub fn stop_nv_define() -> R<()> {
+    let nv = stop_nv_counter()?;
+    run_owner(&[
+        "tpm2_nvdefine", &nv, "-C", "o",
+        "-a", "nt=counter|ownerwrite|ownerread|authread",
+    ])?;
+    run_owner(&["tpm2_nvincrement", &nv, "-C", "o"])?;
+    Ok(())
+}
+
+/// Refuse a stop counter that is not a non-orderly counter, for the same
+/// reason as `check_counter_attributes`: an orderly counter can roll back
+/// across a power cut, and a rolled-back stop counter can un-stop the agent.
+pub fn verify_stop_counter() -> R<()> {
+    let nv = stop_nv_counter()?;
+    let o = run(&["tpm2_nvreadpublic", &nv])?;
+    let attrs = parse_nv_attributes(&String::from_utf8_lossy(&o))?;
+    if attrs & TPMA_NV_TPM_NT_MASK != TPM_NT_COUNTER {
+        return Err(format!("{nv} is not a counter index (attributes 0x{attrs:08x})"));
+    }
+    if attrs & TPMA_NV_ORDERLY != 0 {
+        return Err(format!("{nv} is orderly (attributes 0x{attrs:08x}) and can roll back"));
+    }
+    Ok(())
+}
+
+/// Read the stop counter with the index's own auth.
+pub fn stop_nv_read(work: &Path) -> R<u64> {
+    let nv = stop_nv_counter()?;
+    let f = work.join("stop-counter.bin");
+    let fs_ = f.to_string_lossy().to_string();
+    run(&["tpm2_nvread", &nv, "-C", &nv, "-o", &fs_])?;
+    let raw = std::fs::read(&f).map_err(|e| format!("read stop counter: {e}"))?;
+    if raw.len() != 8 {
+        return Err(format!("stop counter is {} bytes, expected 8", raw.len()));
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&raw);
+    Ok(u64::from_be_bytes(b))
+}
+
+/// Advance the stop counter by one. Owner-authorized.
+pub fn stop_nv_increment() -> R<()> {
+    let nv = stop_nv_counter()?;
+    run_owner(&["tpm2_nvincrement", &nv, "-C", "o"])?;
+    Ok(())
+}
+
+/// Have the TPM itself sign the stop counter's current value with the AK.
+///
+/// `TPM2_NV_Certify` reads the index inside the TPM and returns a
+/// `TPMS_ATTEST` of type `TPM_ST_ATTEST_NV` carrying the index name, the
+/// offset and the bytes read, with `extraData = qualifying`. The value a
+/// verifier sees is therefore the TPM's, not whatever the caller claims.
+pub fn stop_nv_certify(qualifying: &[u8; 32], attest: &Path, sig: &Path) -> R<()> {
+    let nv = stop_nv_counter()?;
+    let hex: String = qualifying.iter().map(|b| format!("{b:02x}")).collect();
+    let (a, s) = (attest.to_string_lossy().to_string(), sig.to_string_lossy().to_string());
+    let h = ak_handle()?;
+    run(&[
+        "tpm2_nvcertify", "-C", &h, "-c", &nv, "-g", "sha256", "-s", "ecdsa", "-f", "plain",
+        "-q", &hex, "--size", "8", "--offset", "0", "--attestation", &a, "-o", &s, &nv,
+    ])?;
+    Ok(())
 }
 
 /// Read the selected PCRs, returning the raw concatenated bank contents.

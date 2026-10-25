@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/attest-envelope", "crates/attest-appraise", "crates/attest-stop", "crates/attest-tpm", "crates/prover"]
+members = ["crates/attest-envelope", "crates/attest-appraise", "crates/attest-stop", "crates/attest-tpm", "crates/prover", "crates/stop"]
 # The registrar has its own workspace and lock file; see tools/registrar/Cargo.toml.
 exclude = ["tools/registrar"]
 
