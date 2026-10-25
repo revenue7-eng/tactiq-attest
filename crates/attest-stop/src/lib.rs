@@ -71,8 +71,15 @@
 //! signatures: any process allowed to use the AK could. Tying the answer to
 //! the stop service is the job of the key's authorization and of the
 //! operating system's policy, not of this format. A verifier must also pin
-//! the stop counter's index name (recorded at registration), or a certify of
-//! some other counter would pass.
+//! the stop counter's index name, or a certify of some other counter would
+//! pass. The registrar does not record that name yet; until it does, the
+//! verifier has to obtain it from the device out of band.
+//!
+//! Nor does a receipt reveal an owner who deleted and redefined the stop
+//! index: with the same attributes the index name is the same, and the new
+//! counter continues from the TPM's highest value, so the result reads like
+//! an ordinary `recover`. Closing that is the job of an operator policy on
+//! the index (with `POLICY_DELETE`), which the stop service does not have yet.
 //!
 //! Receipt
 //! -------

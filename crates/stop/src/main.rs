@@ -75,9 +75,13 @@ fn main() {
     }
 }
 
-/// The shared work directory: created 0700, and refused if it belongs to
-/// someone else or is open to others. Anyone who can write here could plant
-/// tool outputs.
+/// The shared work directory, holding the admin lock and each process's
+/// private scratch directory. Refused if it is a symlink, not a directory,
+/// writable by group or others, or owned by anyone other than the caller or
+/// root. Root may use a directory the service user owns, so an operator
+/// running as root is never locked out of `trip` by ownership. (The scratch
+/// directories are 0700 regardless, and the counter is never read from a
+/// file.)
 fn work_dir() -> Result<PathBuf, String> {
     let w = PathBuf::from(WORK_DIR);
     if !w.exists() {
@@ -88,11 +92,13 @@ fn work_dir() -> Result<PathBuf, String> {
     }
     let md = fs::symlink_metadata(&w).map_err(|e| format!("stat {WORK_DIR}: {e}"))?;
     let me = fs::metadata("/proc/self").map_err(|e| format!("stat /proc/self: {e}"))?.uid();
-    if !md.is_dir() || md.uid() != me || md.permissions().mode() & 0o077 != 0 {
+    let mode = md.permissions().mode() & 0o7777;
+    let owner_ok = md.uid() == me || me == 0 || md.uid() == 0;
+    if !md.is_dir() || !owner_ok || mode & 0o022 != 0 {
         return Err(format!(
-            "{WORK_DIR} must be a directory owned by uid {me} with mode 0700 (is uid {}, mode {:o})",
-            md.uid(),
-            md.permissions().mode() & 0o7777
+            "{WORK_DIR} must be a real directory, not writable by group or others, owned by uid {me} or root \
+             (is uid {}, mode {mode:o})",
+            md.uid()
         ));
     }
     Ok(w)
@@ -226,12 +232,30 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Exclusive lock for every command that changes or certifies the counter.
+/// Exclusive lock for every operator command. Waits at most `LOCK_WAIT`, so a
+/// stuck command cannot leave `trip` waiting forever behind it.
+const LOCK_WAIT: Duration = Duration::from_secs(20);
+
 fn admin_lock(work: &Path) -> Result<File, String> {
     let p = work.join("admin.lock");
     let f = File::create(&p).map_err(|e| format!("create {}: {e}", p.display()))?;
-    f.lock().map_err(|e| format!("lock {}: {e}", p.display()))?;
-    Ok(f)
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "another tactiq-stop command has held {} for {}s; nothing was changed",
+                    p.display(),
+                    LOCK_WAIT.as_secs()
+                ))
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(format!("lock {}: {e}", p.display())),
+        }
+    }
 }
 
 fn cmd_status(nonce_hex: Option<&str>) -> Result<(), String> {
@@ -255,8 +279,9 @@ fn admin(f: fn(&dyn StopTpm) -> Result<Transition, TransitionError>, want: State
     let work = work_dir()?;
     let _lock = admin_lock(&work)?;
     attest_tpm::verify_stop_counter()?;
-    let scratch = Scratch::new(&work)?;
-    let tpm = Real { scratch: &scratch.0 };
+    // Read and increment go through tpm2-tools' standard output; nothing is
+    // written to the scratch path, so none is created.
+    let tpm = Real { scratch: &work };
     match f(&tpm) {
         Ok(Transition::Changed { from, to }) => {
             println!("stop counter {from} -> {to}: {:?}", core::state_of(to))
@@ -324,13 +349,20 @@ fn define(args: &[String]) -> Result<(), String> {
     let _lock = admin_lock(&work)?;
     let nv = attest_tpm::STOP_NV_COUNTER;
     if attest_tpm::nv_defined(nv)? {
-        attest_tpm::verify_stop_counter()?;
-        return Err(format!("{nv} already defined; use trip or recover to change the state"));
+        let attrs = attest_tpm::stop_nv_attributes()?;
+        attest_tpm::check_stop_attributes(attrs)?;
+        if attest_tpm::stop_attributes_written(attrs) {
+            return Err(format!("{nv} already defined; use trip or recover to change the state"));
+        }
+        // An earlier define created the index but its first increment
+        // failed: finish it rather than leave an index nothing can read.
+        println!("{nv} defined but never written; writing it now");
+        attest_tpm::stop_nv_first_write()?;
+    } else {
+        attest_tpm::stop_nv_define()?;
     }
-    attest_tpm::stop_nv_define()?;
     attest_tpm::verify_stop_counter()?;
-    let scratch = Scratch::new(&work)?;
-    let tpm = Real { scratch: &scratch.0 };
+    let tpm = Real { scratch: &work };
     // The TPM chose the first value; its parity is not ours. Set the state
     // the operator asked for, with at most one increment.
     match core::settle(&tpm, want) {

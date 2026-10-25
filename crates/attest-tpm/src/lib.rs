@@ -404,13 +404,11 @@ pub fn nv_increment_and_read(work: &Path) -> R<u64> {
 /// on this TPM has held), so its parity, and with it the initial stop state,
 /// is not known in advance: the caller reads it and sets the state it wants.
 pub fn stop_nv_define() -> R<()> {
-    let nv = STOP_NV_COUNTER;
     run_owner(&[
-        "tpm2_nvdefine", nv, "-C", "o",
+        "tpm2_nvdefine", STOP_NV_COUNTER, "-C", "o",
         "-a", "nt=counter|ownerwrite|ownerread|authread",
     ])?;
-    run_owner(&["tpm2_nvincrement", nv, "-C", "o"])?;
-    Ok(())
+    stop_nv_first_write()
 }
 
 /// Check the stop counter's attributes against `STOP_NV_ATTRIBUTES`.
@@ -426,8 +424,25 @@ pub fn check_stop_attributes(attrs: u32) -> R<()> {
 
 /// Refuse a stop counter that is not exactly the index this code expects.
 pub fn verify_stop_counter() -> R<()> {
+    check_stop_attributes(stop_nv_attributes()?)
+}
+
+/// The stop counter's attribute word as the TPM reports it.
+pub fn stop_nv_attributes() -> R<u32> {
     let o = run(&["tpm2_nvreadpublic", STOP_NV_COUNTER])?;
-    check_stop_attributes(parse_nv_attributes(&String::from_utf8_lossy(&o))?)
+    parse_nv_attributes(&String::from_utf8_lossy(&o))
+}
+
+/// Whether the stop counter has been written (incremented) at least once.
+/// A counter that was defined but never incremented cannot be read.
+pub fn stop_attributes_written(attrs: u32) -> bool {
+    attrs & TPMA_NV_WRITTEN != 0
+}
+
+/// First increment of a defined but never written stop counter.
+pub fn stop_nv_first_write() -> R<()> {
+    run_owner(&["tpm2_nvincrement", STOP_NV_COUNTER, "-C", "o"])?;
+    Ok(())
 }
 
 /// The TPM name of the stop counter (nameAlg || digest of its public area),
