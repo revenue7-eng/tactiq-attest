@@ -15,7 +15,12 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Whole-request deadline, not a per-read timeout: a client that sends one
+/// byte at a time cannot hold the (single) connection slot past this.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(3);
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Bounds on what the service reads. A request beyond them is refused, never
 /// truncated: a truncated body would give a request digest of a different
@@ -60,11 +65,20 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Request, usize)>, String> {
     let mut length: Option<usize> = None;
     for l in lines {
         let (k, v) = l.split_once(':').ok_or_else(|| format!("bad header line {l:?}"))?;
-        let (k, v) = (k.trim(), v.trim());
+        // No whitespace inside or around the name (RFC 9112 5.1): a space
+        // before the colon is how one parser's header becomes another's body.
+        if k.is_empty() || !k.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(format!("bad header name {k:?}"));
+        }
+        let v = v.trim_matches(|c| c == ' ' || c == '\t');
         if k.eq_ignore_ascii_case("transfer-encoding") {
             return Err("chunked or other transfer encodings are not accepted".into());
         }
         if k.eq_ignore_ascii_case("content-length") {
+            // Plain digits only: Rust's parser would also take "+5".
+            if v.is_empty() || v.len() > 8 || !v.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("bad content-length {v:?}"));
+            }
             let n: usize = v.parse().map_err(|_| format!("bad content-length {v:?}"))?;
             if length.is_some_and(|m| m != n) {
                 return Err("conflicting content-length headers".into());
@@ -90,15 +104,26 @@ fn find(h: &[u8], n: &[u8]) -> Option<usize> {
     h.windows(n.len()).position(|w| w == n)
 }
 
-/// Read one request from the stream.
+/// Read one request from the stream, within `REQUEST_DEADLINE` in total.
+/// Bytes after the request are refused: the service answers one request per
+/// connection and does not guess what a second one was meant to be.
 pub fn read_request(s: &mut TcpStream) -> Result<Request, String> {
-    s.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    s.set_write_timeout(Some(WRITE_TIMEOUT)).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        if let Some((req, _)) = parse(&buf)? {
+        if let Some((req, used)) = parse(&buf)? {
+            if used != buf.len() {
+                return Err(format!("{} bytes after the request", buf.len() - used));
+            }
             return Ok(req);
         }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("request not complete within the deadline".into());
+        }
+        s.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
         let k = s.read(&mut chunk).map_err(|e| format!("read: {e}"))?;
         if k == 0 {
             return Err("connection closed before the request was complete".into());
@@ -157,6 +182,16 @@ mod tests {
         assert!(parse(b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab").is_err());
         let big = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", BODY_MAX + 1);
         assert!(parse(big.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn content_length_is_plain_digits_and_names_have_no_spaces() {
+        assert!(parse(b"POST / HTTP/1.1\r\nContent-Length: +2\r\n\r\nab").is_err());
+        assert!(parse(b"POST / HTTP/1.1\r\nContent-Length: -0\r\n\r\n").is_err());
+        assert!(parse(b"POST / HTTP/1.1\r\nContent-Length : 2\r\n\r\nab").is_err());
+        assert!(parse(b"POST / HTTP/1.1\r\nContent-Length: 2 2\r\n\r\nab").is_err());
+        let (r, _) = parse(b"POST / HTTP/1.1\r\nContent-Length:\t2 \r\n\r\nab").unwrap().unwrap();
+        assert_eq!(r.body, b"ab");
     }
 
     #[test]

@@ -32,7 +32,7 @@ a minimum.
 | `attest-stop` | Body of the stop service's two evidence sections: the stop record (tag `0x0004`) and the verifier nonce (tag `0x0005`). Parse and build, exact lengths, no state. |
 | `attest-tpm` | Every TPM call the device binaries make, in one crate. Shells out to `tpm2-tools` today. |
 | `prover` | `tactiq-agent`: provisions an identity, then produces one signed envelope per cycle. |
-| `stop` | `tactiq-stop`: the agent stop service. Answers agentgateway's `extAuthz` before every tool call; the stop state is the parity of a TPM NV counter, and every refusal carries a receipt with the AK quote over the boot PCRs and the TPM's own `NV_Certify` of that counter. |
+| `stop` | `tactiq-stop`: the agent stop service. Answers agentgateway's `extAuthz` before every tool call; the stop state is the parity of a TPM NV counter, and every refusal carries a receipt with the AK quote over the boot PCRs and the TPM's own `NV_Certify` of that counter, checked on the device before it is handed out. Not yet closed: the counter is owner-writable (empty owner auth on TactiQ OS), the AK is shared with the agent, and a release image has no operator channel. See the service's own documentation. |
 
 ## The evidence bundle
 

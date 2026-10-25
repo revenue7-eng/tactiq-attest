@@ -58,6 +58,21 @@
 //!   || stop record body || nonce), with an empty nonce when there is none.
 //!   The TPM-signed counter value is thereby tied to this one record (and to
 //!   the verifier's challenge), so it cannot be lifted into another.
+//! * The quote's qualifying data = SHA-256(`"tactiq-stop/quote/v1\0"` ||
+//!   msg). An agent envelope's quote uses SHA-256(msg) alone, so a stop
+//!   receipt can never pass as an agent envelope, or the reverse.
+//!
+//! What a valid receipt does and does not prove
+//! --------------------------------------------
+//! It proves that a TPM holding the device's AK, on a device booted into the
+//! measured build named by the quoted PCRs, signed this record, and that the
+//! TPM itself read the named NV index at the value in the record. It does
+//! not by itself prove which process on that device asked for the
+//! signatures: any process allowed to use the AK could. Tying the answer to
+//! the stop service is the job of the key's authorization and of the
+//! operating system's policy, not of this format. A verifier must also pin
+//! the stop counter's index name (recorded at registration), or a certify of
+//! some other counter would pass.
 //!
 //! Receipt
 //! -------
@@ -238,6 +253,14 @@ pub fn request_digest(method: &str, path: &str, body: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Qualifying data for the stop service's quote over its message.
+pub fn stop_quote_qualifying(msg: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"tactiq-stop/quote/v1\0");
+    h.update(msg);
+    h.finalize().into()
+}
+
 /// Qualifying data for the NV certify of the stop counter.
 pub fn certify_qualifying(record_body: &[u8], nonce: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -398,6 +421,143 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
+}
+
+/// `TPM_GENERATED_VALUE`: every TPM-produced attestation starts with it.
+pub const TPM_GENERATED: u32 = 0xFF54_4347;
+/// `TPM_ST_ATTEST_NV`.
+pub const ST_ATTEST_NV: u16 = 0x8014;
+
+/// The fields of a `TPMS_ATTEST` of type `TPM_ST_ATTEST_NV` that a check of
+/// the stop counter needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NvCertifyInfo {
+    pub qualified_signer: Vec<u8>,
+    pub extra_data: Vec<u8>,
+    pub index_name: Vec<u8>,
+    pub offset: u16,
+    pub contents: Vec<u8>,
+}
+
+/// Parse a `TPMS_ATTEST` produced by `TPM2_NV_Certify` (TPM 2.0 Part 2,
+/// 10.12.8 and 10.12.13):
+///
+/// ```text
+/// magic(4) || type(2) || qualifiedSigner(TPM2B) || extraData(TPM2B)
+///          || clockInfo(17) || firmwareVersion(8)
+///          || indexName(TPM2B) || offset(2) || nvContents(TPM2B)
+/// ```
+///
+/// Exact: every byte is consumed or the structure is refused. The signature
+/// over it is not checked here; that needs the AK and is the verifier's.
+pub fn parse_nv_certify_info(attest: &[u8]) -> Result<NvCertifyInfo, String> {
+    let mut r = Be::new(attest);
+    if r.u32()? != TPM_GENERATED {
+        return Err("nv certify: not a TPM-generated structure".into());
+    }
+    let t = r.u16()?;
+    if t != ST_ATTEST_NV {
+        return Err(format!("nv certify: type 0x{t:04x}, expected 0x{ST_ATTEST_NV:04x}"));
+    }
+    let qualified_signer = r.tpm2b()?.to_vec();
+    let extra_data = r.tpm2b()?.to_vec();
+    r.skip(17)?; // clockInfo: clock(8) resetCount(4) restartCount(4) safe(1)
+    r.skip(8)?; // firmwareVersion
+    let index_name = r.tpm2b()?.to_vec();
+    let offset = r.u16()?;
+    let contents = r.tpm2b()?.to_vec();
+    if !r.b.is_empty() {
+        return Err(format!("nv certify: {} trailing bytes", r.b.len()));
+    }
+    Ok(NvCertifyInfo { qualified_signer, extra_data, index_name, offset, contents })
+}
+
+/// Check that a certify says what the record says: bound to `qualifying`,
+/// over the expected index, the whole 8-byte counter from offset 0, at the
+/// record's epoch. Used by the service before it hands out a receipt, and
+/// by any verifier.
+pub fn check_counter_certify(
+    attest: &[u8],
+    qualifying: &[u8; 32],
+    index_name: &[u8],
+    stop_epoch: u64,
+) -> Result<(), String> {
+    let i = parse_nv_certify_info(attest)?;
+    if i.extra_data != qualifying {
+        return Err("nv certify: bound to a different record or nonce".into());
+    }
+    if i.index_name != index_name {
+        return Err("nv certify: certifies a different NV index".into());
+    }
+    if i.offset != 0 || i.contents.len() != 8 {
+        return Err(format!(
+            "nv certify: covers {} bytes at offset {}, expected 8 at 0",
+            i.contents.len(),
+            i.offset
+        ));
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&i.contents);
+    let v = u64::from_be_bytes(b);
+    if v != stop_epoch {
+        return Err(format!("nv certify: the TPM read {v}, the record says {stop_epoch}"));
+    }
+    Ok(())
+}
+
+/// Big-endian reader for TPM structures.
+struct Be<'a> {
+    b: &'a [u8],
+}
+
+impl<'a> Be<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Be { b }
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if n > self.b.len() {
+            return Err(format!("nv certify: needs {n} bytes, {} left", self.b.len()));
+        }
+        let (h, t) = self.b.split_at(n);
+        self.b = t;
+        Ok(h)
+    }
+    fn skip(&mut self, n: usize) -> Result<(), String> {
+        self.take(n).map(|_| ())
+    }
+    fn u16(&mut self) -> Result<u16, String> {
+        let h = self.take(2)?;
+        Ok(u16::from_be_bytes([h[0], h[1]]))
+    }
+    fn u32(&mut self) -> Result<u32, String> {
+        let h = self.take(4)?;
+        Ok(u32::from_be_bytes([h[0], h[1], h[2], h[3]]))
+    }
+    fn tpm2b(&mut self) -> Result<&'a [u8], String> {
+        let n = self.u16()? as usize;
+        self.take(n)
+    }
+}
+
+/// Build a `TPM_ST_ATTEST_NV` structure the way a TPM lays it out. For tests
+/// on both sides of the format; a real one comes from the TPM.
+#[doc(hidden)]
+pub fn build_nv_certify_info_for_tests(info: &NvCertifyInfo) -> Vec<u8> {
+    let mut o = Vec::new();
+    o.extend_from_slice(&TPM_GENERATED.to_be_bytes());
+    o.extend_from_slice(&ST_ATTEST_NV.to_be_bytes());
+    for part in [&info.qualified_signer, &info.extra_data] {
+        o.extend_from_slice(&(part.len() as u16).to_be_bytes());
+        o.extend_from_slice(part);
+    }
+    o.extend_from_slice(&[0x11; 17]);
+    o.extend_from_slice(&[0x22; 8]);
+    o.extend_from_slice(&(info.index_name.len() as u16).to_be_bytes());
+    o.extend_from_slice(&info.index_name);
+    o.extend_from_slice(&info.offset.to_be_bytes());
+    o.extend_from_slice(&(info.contents.len() as u16).to_be_bytes());
+    o.extend_from_slice(&info.contents);
+    o
 }
 
 #[cfg(test)]
@@ -576,5 +736,59 @@ mod tests {
         let mut big = b.clone();
         big[5..9].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(Receipt::parse(&big).is_err());
+    }
+
+    fn info(epoch: u64, qd: [u8; 32]) -> NvCertifyInfo {
+        NvCertifyInfo {
+            qualified_signer: vec![0x00, 0x0b, 0xAA, 0xBB],
+            extra_data: qd.to_vec(),
+            index_name: vec![0x00, 0x0b, 0x01, 0x02],
+            offset: 0,
+            contents: epoch.to_be_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn nv_certify_info_round_trips() {
+        let i = info(5, [7; 32]);
+        let b = build_nv_certify_info_for_tests(&i);
+        assert_eq!(parse_nv_certify_info(&b).unwrap(), i);
+    }
+
+    #[test]
+    fn nv_certify_info_refuses_wrong_magic_type_trailing_truncated() {
+        let b = build_nv_certify_info_for_tests(&info(5, [7; 32]));
+        let mut m = b.clone();
+        m[0] = 0;
+        assert!(parse_nv_certify_info(&m).is_err());
+        let mut t = b.clone();
+        t[4..6].copy_from_slice(&0x8018u16.to_be_bytes()); // a quote, not an NV certify
+        assert!(parse_nv_certify_info(&t).is_err());
+        let mut x = b.clone();
+        x.push(0);
+        assert!(parse_nv_certify_info(&x).is_err());
+        assert!(parse_nv_certify_info(&b[..b.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn counter_certify_must_match_every_field() {
+        let qd = [7u8; 32];
+        let name = [0x00, 0x0b, 0x01, 0x02];
+        let ok = build_nv_certify_info_for_tests(&info(5, qd));
+        assert!(check_counter_certify(&ok, &qd, &name, 5).is_ok());
+        assert!(check_counter_certify(&ok, &qd, &name, 6).is_err(), "value moved");
+        assert!(check_counter_certify(&ok, &[8; 32], &name, 5).is_err(), "other record");
+        assert!(check_counter_certify(&ok, &qd, &[0x00, 0x0b, 0x09], 5).is_err(), "other index");
+        let off = build_nv_certify_info_for_tests(&NvCertifyInfo { offset: 1, ..info(5, qd) });
+        assert!(check_counter_certify(&off, &qd, &name, 5).is_err(), "offset");
+        let short = build_nv_certify_info_for_tests(&NvCertifyInfo { contents: vec![5], ..info(5, qd) });
+        assert!(check_counter_certify(&short, &qd, &name, 5).is_err(), "partial read");
+    }
+
+    #[test]
+    fn stop_quote_qualifying_differs_from_a_plain_digest() {
+        let m = [3u8; RECEIPT_MSG_LEN];
+        let plain: [u8; 32] = Sha256::digest(m).into();
+        assert_ne!(stop_quote_qualifying(&m), plain);
     }
 }
