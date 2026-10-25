@@ -21,6 +21,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "attest-stop"
+version = "0.1.0"
+
+[[package]]
 name = "attest-tpm"
 version = "0.1.0"
 dependencies = [
