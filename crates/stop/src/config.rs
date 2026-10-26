@@ -3,11 +3,16 @@
 //! At agentgateway's pinned revision (d204f9c) two defaults do not fit this
 //! service, and both fail without anyone noticing:
 //!
-//! * the request to the authorization service gets a 200 ms timeout
-//!   (`BackendRequestTimeout` in `http/ext_authz.rs`) unless the backend
-//!   policy sets `requestTimeout`. A refusal takes several TPM operations;
-//!   at 200 ms the gateway gives up and denies, and the caller never sees the
-//!   receipt. Even an allow can miss it.
+//! * in http mode the request to the authorization service gets a fixed
+//!   200 ms timeout (`BackendRequestTimeout` in `http/ext_authz.rs`), and the
+//!   `policies` of the extAuthz block are not passed to that call at all, so
+//!   `requestTimeout` there does not change it. A signed refusal took 2.4 s
+//!   on the bench (an SPI TPM, four tpm2-tools runs). At 200 ms the gateway
+//!   denies on its own and the caller never sees the receipt. TactiQ OS
+//!   carries a one-line patch to agentgateway for this; upstream main (Oct
+//!   2026) passes the policies and defaults to 2 s, still short of 2.4 s.
+//!   The guard keeps requiring a `requestTimeout` of at least 3 s, which is
+//!   what a revision that honours it needs.
 //! * the body is sent only with `includeRequestBody`, and is cut at
 //!   `maxRequestBytes`, whose schema default at that revision is 0. The
 //!   request digest would then describe an empty or truncated body.

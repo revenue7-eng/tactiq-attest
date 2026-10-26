@@ -82,15 +82,17 @@ fn main() {
 /// running as root is never locked out of `trip` by ownership. (The scratch
 /// directories are 0700 regardless, and the counter is never read from a
 /// file.)
+///
+/// Never created here. The operating system creates it at boot (tmpfiles,
+/// with the service's owner and SELinux label) and keeps it across service
+/// restarts. A directory created by whichever command ran first gets that
+/// command's owner and label: on the bench a root `define` before the first
+/// start made it root-owned `var_run_t`, and the service could not write it.
 fn work_dir() -> Result<PathBuf, String> {
     let w = PathBuf::from(WORK_DIR);
-    if !w.exists() {
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&w)
-            .map_err(|e| format!("create {WORK_DIR}: {e}"))?;
-    }
-    let md = fs::symlink_metadata(&w).map_err(|e| format!("stat {WORK_DIR}: {e}"))?;
+    let md = fs::symlink_metadata(&w).map_err(|e| {
+        format!("{WORK_DIR}: {e}; it is created at boot by the tactiq-stop tmpfiles entry, not by this command")
+    })?;
     let me = fs::metadata("/proc/self").map_err(|e| format!("stat /proc/self: {e}"))?.uid();
     let mode = md.permissions().mode() & 0o7777;
     let owner_ok = md.uid() == me || me == 0 || md.uid() == 0;
