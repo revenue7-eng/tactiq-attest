@@ -8,7 +8,8 @@
 //!
 //! Commands
 //!   serve                          answer the gateway on 127.0.0.1:49318
-//!   status [nonce-hex]             write a signed status receipt (nonce 32..128 hex chars)
+//!   status [nonce-hex]             write a signed status receipt to standard output
+//!                                  (nonce 32..128 hex chars); the state goes to stderr
 //!   trip                           stop the agent (idempotent), then confirm through the service
 //!   recover                        lift the stop (idempotent), then confirm through the service
 //!   define [--initial stopped|running]   create the stop counter (default: stopped)
@@ -36,7 +37,7 @@ mod http;
 mod port;
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -260,20 +261,41 @@ fn admin_lock(work: &Path) -> Result<File, String> {
     }
 }
 
+/// The receipt goes to standard output, so the caller names where it lands
+/// (`tactiq-stop status > /tmp/s.tqsr`). Writing it into the current
+/// directory failed on the bench from /root, which is on the read-only root,
+/// and would land wherever the operator happened to stand. Refused before any
+/// TPM work when standard output is a terminal: a binary receipt there is
+/// lost, and the signature spent.
 fn cmd_status(nonce_hex: Option<&str>) -> Result<(), String> {
     let nonce = match nonce_hex {
         Some(h) => hex_decode(h)?,
         None => Vec::new(),
     };
+    let mut stdout = std::io::stdout();
+    if stdout.is_terminal() {
+        return Err("status writes the receipt, a binary file, to standard output; redirect it, \
+                    for example: tactiq-stop status > /tmp/stop-status.tqsr"
+            .into());
+    }
     let work = work_dir()?;
     let _lock = admin_lock(&work)?;
     let scratch = Scratch::new(&work)?;
     let owned = Owned::load(&scratch.0)?;
     let tpm = Real { scratch: &scratch.0 };
     let receipt = core::status(&tpm, &owned.ctx(), &nonce)?;
-    let out = PathBuf::from("stop-status.tqsr");
-    fs::write(&out, &receipt).map_err(|e| format!("write {}: {e}", out.display()))?;
-    println!("status receipt -> {}", out.display());
+    let rec = core::record_of(&receipt)?;
+    stdout
+        .write_all(&receipt)
+        .and_then(|()| stdout.flush())
+        .map_err(|e| format!("write the receipt to standard output: {e}"))?;
+    eprintln!(
+        "status receipt: stop counter {}, {:?}, {} bytes{}",
+        rec.stop_epoch,
+        rec.state,
+        receipt.len(),
+        if nonce.is_empty() { "" } else { ", bound to the given nonce" }
+    );
     Ok(())
 }
 

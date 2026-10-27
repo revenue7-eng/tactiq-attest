@@ -3,7 +3,7 @@
 //! what trip and recover do. Everything here runs against `StopTpm`.
 
 use attest_envelope::{
-    build_bundle, build_canonical, encode_pcr_selection, MSG_LEN, TAG_STOP_STATE,
+    build_bundle, build_canonical, encode_pcr_selection, parse_bundle, MSG_LEN, TAG_STOP_STATE,
     TAG_TPM_NV_CERTIFY, TAG_VERIFIER_NONCE,
 };
 use attest_stop::{
@@ -81,6 +81,18 @@ pub fn status(tpm: &dyn StopTpm, ctx: &Ctx, nonce: &[u8]) -> R<Vec<u8>> {
         policy_digest: ctx.policy_digest,
     };
     sign(tpm, ctx, &rec, nonce)
+}
+
+/// The stop record a receipt carries, read back from the receipt itself, so
+/// what a command reports about a receipt is what the receipt says. Parsing
+/// only: this does not check the signatures.
+pub fn record_of(receipt: &[u8]) -> R<StopRecord> {
+    let r = Receipt::parse(receipt)?;
+    let sections = parse_bundle(&r.bundle)?;
+    match sections.iter().filter(|s| s.tag == TAG_STOP_STATE).collect::<Vec<_>>().as_slice() {
+        [s] => StopRecord::parse(s.body),
+        found => Err(format!("receipt: {} stop records, expected one", found.len())),
+    }
 }
 
 /// Assemble and sign a receipt for `rec`.
@@ -297,6 +309,30 @@ mod tests {
             let rec = StopRecord::parse(&s[0].1).unwrap();
             assert_eq!((rec.kind, rec.state, rec.stop_epoch), (Kind::Status, want, c));
         }
+    }
+
+    #[test]
+    fn record_of_reads_back_what_was_signed() {
+        for (c, want) in [(6u64, State::Running), (7, State::Stopped)] {
+            let rec = record_of(&status(&Fake::at(c), &ctx(), &[]).unwrap()).unwrap();
+            assert_eq!((rec.kind, rec.state, rec.stop_epoch), (Kind::Status, want, c));
+        }
+        let Admission::Refuse(b) = admit(&Fake::at(9), &ctx(), [7; 32]).unwrap() else {
+            panic!("an odd counter must refuse")
+        };
+        let rec = record_of(&b).unwrap();
+        assert_eq!((rec.kind, rec.state, rec.stop_epoch), (Kind::Refusal { request_digest: [7; 32] }, State::Stopped, 9));
+    }
+
+    #[test]
+    fn record_of_refuses_what_is_not_a_receipt() {
+        let b = status(&Fake::at(2), &ctx(), &[]).unwrap();
+        assert!(record_of(&b[..b.len() - 1]).is_err(), "truncated");
+        assert!(record_of(b"TQSR").is_err());
+        assert!(record_of(&[]).is_err());
+        let mut other = b.clone();
+        other[0] = b'X';
+        assert!(record_of(&other).is_err(), "wrong magic");
     }
 
     #[test]
