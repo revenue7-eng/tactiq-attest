@@ -10,10 +10,17 @@ publish = false
 name = "tactiq-stop"
 path = "src/main.rs"
 
-# Workspace crates plus sha2, which the envelope already brings in: no async
-# runtime, no HTTP framework, no serialisation library in the service.
+# Workspace crates plus sha2, which the envelope already brings in, and p256
+# with pem, already in the workspace for attest-appraise, to check the
+# operator's release: no async runtime, no HTTP framework, no serialisation
+# library in the service.
 [dependencies]
 attest-envelope = { path = "../attest-envelope" }
 attest-stop = { path = "../attest-stop" }
 attest-tpm = { path = "../attest-tpm" }
 sha2 = "0.10"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pem"] }
+
+[dev-dependencies]
+# Tests sign releases; signing needs the arithmetic p256 brings by default.
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }

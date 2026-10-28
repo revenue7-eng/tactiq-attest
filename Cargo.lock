@@ -410,6 +410,7 @@ dependencies = [
  "attest-envelope",
  "attest-stop",
  "attest-tpm",
+ "p256",
  "sha2",
 ]
 

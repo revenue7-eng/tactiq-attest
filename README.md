@@ -32,7 +32,7 @@ a minimum.
 | `attest-stop` | Formats of the stop service: the stop record (tag `0x0004`), the verifier nonce (`0x0005`), the NV certify section (`0x0006`) with a parser for the TPM's `TPM_ST_ATTEST_NV` structure, and the receipt container. Parse, build and check, exact lengths, no state. |
 | `attest-tpm` | Every TPM call the device binaries make, in one crate. Shells out to `tpm2-tools` today. |
 | `prover` | `tactiq-agent`: provisions an identity, then produces one signed envelope per cycle. |
-| `stop` | `tactiq-stop`: the agent stop service. Answers agentgateway's `extAuthz` before every tool call; the stop state is the parity of a TPM NV counter, and every refusal carries a receipt with the AK quote over the boot PCRs and the TPM's own `NV_Certify` of that counter, checked on the device before it is handed out. Not yet closed: the counter is owner-writable (empty owner auth on TactiQ OS), the AK is shared with the agent, and a release image has no operator channel. See the service's own documentation. |
+| `stop` | `tactiq-stop`: the agent stop service. Answers agentgateway's `extAuthz` before every tool call; the stop state is the parity of a TPM NV counter, and every refusal carries a receipt with the AK quote over the boot PCRs and the TPM's own `NV_Certify` of that counter, checked on the device before it is handed out. A stop is lifted only by the operator's release, a record naming the device and the next epoch, signed with the operator's key (ECDSA P-256, `openssl dgst -sha256 -sign`), whose public half is on the device's dm-verity root; stopping needs nothing. Not yet closed: the AK is shared with the agent, and a release image has no operator channel. See the service's own documentation. |
 
 ## The evidence bundle
 
