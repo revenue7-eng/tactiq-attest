@@ -72,8 +72,8 @@
 //! the stop service is the job of the key's authorization and of the
 //! operating system's policy, not of this format. A verifier must also pin
 //! the stop counter's index name, or a certify of some other counter would
-//! pass. The registrar does not record that name yet; until it does, the
-//! verifier has to obtain it from the device out of band.
+//! pass. The name follows from the index's definition, so the verifier
+//! computes it (`stop_index_name`) instead of taking it from the device.
 //!
 //! Nor does a receipt reveal an owner who deleted and redefined the stop
 //! index: with the same attributes the index name is the same, and the new
@@ -512,6 +512,36 @@ pub fn check_counter_certify(
     Ok(())
 }
 
+/// TPM handle of the stop counter.
+pub const STOP_NV_INDEX: u32 = 0x0150_0017;
+/// Its attribute word once written: counter, ownerwrite, ownerread, authread,
+/// written. The device defines it with exactly these (`attest-tpm`, whose
+/// constant a test in the stop service pins to this one).
+pub const STOP_NV_ATTRIBUTES_WRITTEN: u32 = 0x2006_0012;
+
+/// TPM name of the stop counter: `sha256 alg id || SHA-256(TPMS_NV_PUBLIC)`,
+/// over index, nameAlg sha256, the attribute word above, an empty auth
+/// policy and a data size of 8.
+///
+/// The name follows from the definition alone, so a verifier computes it and
+/// needs nothing from the device. A certify can only be made of a written
+/// counter, and the written bit is in the name, so this is the one value a
+/// valid certify of the stop counter names. An index defined any other way
+/// (another handle, attributes, policy or size) has another name and fails
+/// `check_counter_certify`.
+pub fn stop_index_name() -> [u8; 34] {
+    let mut pub_area = Vec::with_capacity(14);
+    pub_area.extend_from_slice(&STOP_NV_INDEX.to_be_bytes());
+    pub_area.extend_from_slice(&0x000Bu16.to_be_bytes());
+    pub_area.extend_from_slice(&STOP_NV_ATTRIBUTES_WRITTEN.to_be_bytes());
+    pub_area.extend_from_slice(&0u16.to_be_bytes());
+    pub_area.extend_from_slice(&8u16.to_be_bytes());
+    let mut name = [0u8; 34];
+    name[..2].copy_from_slice(&0x000Bu16.to_be_bytes());
+    name[2..].copy_from_slice(&Sha256::digest(&pub_area));
+    name
+}
+
 /// Big-endian reader for TPM structures.
 struct Be<'a> {
     b: &'a [u8],
@@ -570,6 +600,15 @@ pub fn build_nv_certify_info_for_tests(info: &NvCertifyInfo) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_stop_index_name_is_the_one_a_tpm_reports() {
+        // `tpm2_nvdefine 0x1500017 -C o -a "nt=counter|ownerwrite|ownerread|authread"`,
+        // one `tpm2_nvincrement`, then `tpm2_nvreadpublic 0x1500017` on swtpm 0.7.3.
+        let want = "000b3284b95a75e1ef9c345dfb42509d967df6966347b65f5831d46f3d8efa2bc737";
+        let got: String = stop_index_name().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got, want);
+    }
 
     fn status(state: State) -> StopRecord {
         StopRecord { kind: Kind::Status, state, stop_epoch: 7, policy_digest: [0x11; 32] }

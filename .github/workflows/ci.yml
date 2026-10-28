@@ -29,3 +29,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --manifest-path tools/registrar/Cargo.toml
+  # The stop receipt verifier is its own workspace too.
+  stop-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --manifest-path tools/stop-verify/Cargo.toml

@@ -15,3 +15,6 @@ tools/registrar/tests/fixtures/**/*.crl binary
 # release, so neither may be rewritten on checkout.
 crates/stop/testdata/release binary
 crates/stop/testdata/release.sig binary
+# Stop receipts and keys from swtpm: TPM signatures over exact bytes.
+crates/attest-appraise/tests/fixtures/stop/*.tqsr binary
+crates/attest-appraise/tests/fixtures/stop/*.pub binary

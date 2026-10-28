@@ -174,6 +174,10 @@ impl AkKey {
     /// quote's `qualifiedSigner` (that is the qualified name). Used by AK
     /// registration against the EK, which works on the name.
     pub fn name(&self) -> &[u8; 34] { &self.name }
+
+    /// For the other checks of this crate that verify under an AK (the stop
+    /// receipt). Not public, for the reason in the type's documentation.
+    pub(crate) fn verifying_key(&self) -> &VerifyingKey { &self.vk }
 }
 
 /// What the verifier holds for one device.
