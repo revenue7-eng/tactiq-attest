@@ -11,15 +11,16 @@ use attest_stop::{
     NvCertify, Receipt, State, StopRecord,
 };
 
-use crate::port::{StopTpm, R};
+use crate::port::{ReleaseStore, StopTpm, R};
+use crate::release::{self, OperatorKey};
 
-/// The stop state is the parity of the stop counter: odd = stopped. Trip and
-/// recover each advance it by one, so the state changes only by an increment.
+/// The parity of the stop counter: odd = stopped. Trip and recover each
+/// advance it by one, so the parity changes only by an increment.
 ///
-/// What this does not protect against, in this version: anyone who can write
-/// the index (the owner hierarchy, whose auth is empty on TactiQ OS) can
-/// advance it, and the owner can delete and redefine it. Closing that needs
-/// an operator policy on the index and is a separate step.
+/// Parity alone does not let a call through. Anyone who can write the index
+/// (the owner hierarchy, whose auth is empty on TactiQ OS) can advance it,
+/// and the owner can delete and redefine it, so an even counter is running
+/// only with the operator's release for that exact value (`gate`).
 pub fn state_of(counter: u64) -> State {
     if counter.is_multiple_of(2) {
         State::Running
@@ -28,8 +29,53 @@ pub fn state_of(counter: u64) -> State {
     }
 }
 
+/// What lifting a stop is checked against: the device, the operator's
+/// public key and where the release is read from.
+pub struct Lift<'a> {
+    pub device_id: &'a str,
+    pub operator_key: &'a OperatorKey,
+    pub release: &'a dyn ReleaseStore,
+}
+
+/// Whether a call may pass at this counter value.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// Even, with a valid release for exactly this value.
+    Open,
+    /// Odd: stopped.
+    Stopped,
+    /// Even, but no valid release for this value: still a stop. The reason
+    /// says what was missing or wrong.
+    Unreleased(String),
+}
+
+impl Gate {
+    pub fn state(&self) -> State {
+        match self {
+            Gate::Open => State::Running,
+            _ => State::Stopped,
+        }
+    }
+}
+
+/// Decide the gate for `counter`. An unreadable release is an error, which
+/// every caller turns into a refusal; a missing or invalid one is a stop.
+pub fn gate(lift: &Lift, counter: u64) -> R<Gate> {
+    if state_of(counter) == State::Stopped {
+        return Ok(Gate::Stopped);
+    }
+    Ok(match lift.release.read()? {
+        None => Gate::Unreleased(format!("no operator release for epoch {counter}")),
+        Some((rec, sig)) => match release::check(lift.operator_key, &rec, &sig, lift.device_id, counter) {
+            Ok(()) => Gate::Open,
+            Err(e) => Gate::Unreleased(e),
+        },
+    })
+}
+
 /// Fixed context of one service instance.
 pub struct Ctx<'a> {
+    pub lift: Lift<'a>,
     pub device_id: &'a str,
     pub pcr_spec: &'a str,
     pub pcr_alg: u16,
@@ -53,9 +99,9 @@ pub enum Admission {
 /// service never lets a call through because it could not read the state.
 pub fn admit(tpm: &dyn StopTpm, ctx: &Ctx, request_digest: [u8; 32]) -> R<Admission> {
     let counter = tpm.read_counter()?;
-    match state_of(counter) {
-        State::Running => Ok(Admission::Allow),
-        State::Stopped => {
+    match gate(&ctx.lift, counter)? {
+        Gate::Open => Ok(Admission::Allow),
+        Gate::Stopped | Gate::Unreleased(_) => {
             let rec = StopRecord {
                 kind: Kind::Refusal { request_digest },
                 state: State::Stopped,
@@ -76,7 +122,7 @@ pub fn status(tpm: &dyn StopTpm, ctx: &Ctx, nonce: &[u8]) -> R<Vec<u8>> {
     let counter = tpm.read_counter()?;
     let rec = StopRecord {
         kind: Kind::Status,
-        state: state_of(counter),
+        state: gate(&ctx.lift, counter)?.state(),
         stop_epoch: counter,
         policy_digest: ctx.policy_digest,
     };
@@ -150,16 +196,35 @@ pub struct TransitionError {
     pub now: Option<u64>,
 }
 
-/// Stop the agent. Idempotent: on an already odd counter it does nothing, so
-/// a repeated trip cannot flip the state back to running. Callers hold the
-/// admin lock so two operator commands cannot interleave their read and
-/// increment.
+/// Stop the agent. Needs no release and no key: anyone may stop it.
+/// Idempotent: on an already odd counter it does nothing, so a repeated trip
+/// cannot flip the state back to running. Callers hold the admin lock so two
+/// operator commands cannot interleave their read and increment.
 pub fn trip(tpm: &dyn StopTpm) -> Result<Transition, TransitionError> {
     move_to(tpm, State::Stopped)
 }
 
-/// Lift a stop. Idempotent in the same way.
-pub fn recover(tpm: &dyn StopTpm) -> Result<Transition, TransitionError> {
+/// Lift a stop, with the operator's release for the epoch the counter moves
+/// to. The release is checked before the increment, so a missing or wrong
+/// release changes nothing. On an even counter it does nothing if that value
+/// already has a valid release, and fails if it has none: the agent is then
+/// stopped, and lifting it takes a release for that value.
+pub fn recover(tpm: &dyn StopTpm, lift: &Lift) -> Result<Transition, TransitionError> {
+    let from = tpm.read_counter().map_err(|e| TransitionError { message: e, now: None })?;
+    let target = if state_of(from) == State::Running { from } else { from + 1 };
+    let refuse = |why: String| TransitionError {
+        message: format!("no valid operator release for epoch {target}: {why}; nothing was changed"),
+        now: Some(from),
+    };
+    match gate(lift, target) {
+        Ok(Gate::Open) => {}
+        Ok(Gate::Unreleased(why)) => return Err(refuse(why)),
+        Ok(Gate::Stopped) => return Err(refuse("odd epoch".into())),
+        Err(e) => return Err(refuse(e)),
+    }
+    if target == from {
+        return Ok(Transition::AlreadyThere { at: from });
+    }
     move_to(tpm, State::Running)
 }
 
@@ -197,11 +262,33 @@ fn move_to(tpm: &dyn StopTpm, want: State) -> Result<Transition, TransitionError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port::fake::{Fake, INDEX_NAME};
+    use crate::port::fake::{Fake, FakeRelease, INDEX_NAME};
+    use crate::release::testkey;
     use attest_envelope::{parse_bundle, AttestationMessage};
+    use std::sync::OnceLock;
+
+    fn opkey() -> &'static OperatorKey {
+        static K: OnceLock<OperatorKey> = OnceLock::new();
+        K.get_or_init(testkey::key)
+    }
+
+    fn lift(r: &FakeRelease) -> Lift<'_> {
+        Lift { device_id: "device-A", operator_key: opkey(), release: r }
+    }
+
+    /// A context reading its release from `r`.
+    fn ctx_with(r: &FakeRelease) -> Ctx<'_> {
+        Ctx { lift: lift(r), ..ctx() }
+    }
+
+    /// A context with a valid release for `epoch` (leaked: test only).
+    fn released(epoch: u64) -> Ctx<'static> {
+        ctx_with(Box::leak(Box::new(FakeRelease::signed("device-A", epoch))))
+    }
 
     fn ctx() -> Ctx<'static> {
         Ctx {
+            lift: Lift { device_id: "device-A", operator_key: opkey(), release: Box::leak(Box::new(FakeRelease::none())) },
             device_id: "device-A",
             pcr_spec: "sha256:0,1,8",
             pcr_alg: 0x000B,
@@ -232,7 +319,7 @@ mod tests {
     #[test]
     fn running_lets_the_call_through_without_signing() {
         let t = Fake::at(4);
-        assert_eq!(admit(&t, &ctx(), [0; 32]).unwrap(), Admission::Allow);
+        assert_eq!(admit(&t, &released(4), [0; 32]).unwrap(), Admission::Allow);
         assert!(t.quoted.borrow().is_empty() && t.certified.borrow().is_empty());
     }
 
@@ -304,7 +391,7 @@ mod tests {
     #[test]
     fn status_reports_running_and_stopped() {
         for (c, want) in [(6u64, State::Running), (7, State::Stopped)] {
-            let b = status(&Fake::at(c), &ctx(), &[]).unwrap();
+            let b = status(&Fake::at(c), &released(6), &[]).unwrap();
             let (_, s) = sections_of(&b);
             let rec = StopRecord::parse(&s[0].1).unwrap();
             assert_eq!((rec.kind, rec.state, rec.stop_epoch), (Kind::Status, want, c));
@@ -314,7 +401,7 @@ mod tests {
     #[test]
     fn record_of_reads_back_what_was_signed() {
         for (c, want) in [(6u64, State::Running), (7, State::Stopped)] {
-            let rec = record_of(&status(&Fake::at(c), &ctx(), &[]).unwrap()).unwrap();
+            let rec = record_of(&status(&Fake::at(c), &released(6), &[]).unwrap()).unwrap();
             assert_eq!((rec.kind, rec.state, rec.stop_epoch), (Kind::Status, want, c));
         }
         let Admission::Refuse(b) = admit(&Fake::at(9), &ctx(), [7; 32]).unwrap() else {
@@ -360,12 +447,92 @@ mod tests {
     #[test]
     fn trip_and_recover_are_idempotent() {
         let t = Fake::at(0);
+        let r = FakeRelease::signed("device-A", 2);
         assert_eq!(trip(&t).unwrap(), Transition::Changed { from: 0, to: 1 });
         assert_eq!(trip(&t).unwrap(), Transition::AlreadyThere { at: 1 });
         assert_eq!(t.counter.get(), 1, "a second trip must not un-stop the agent");
-        assert_eq!(recover(&t).unwrap(), Transition::Changed { from: 1, to: 2 });
-        assert_eq!(recover(&t).unwrap(), Transition::AlreadyThere { at: 2 });
+        assert_eq!(recover(&t, &lift(&r)).unwrap(), Transition::Changed { from: 1, to: 2 });
+        assert_eq!(recover(&t, &lift(&r)).unwrap(), Transition::AlreadyThere { at: 2 });
         assert_eq!(t.counter.get(), 2);
+    }
+
+    #[test]
+    fn an_even_counter_without_a_release_refuses_with_a_receipt() {
+        // Parity flipped around recover (another TPM writer, a redefined index).
+        let t = Fake::at(8);
+        let Admission::Refuse(b) = admit(&t, &ctx(), [0x33; 32]).unwrap() else {
+            panic!("no release: the call must be refused")
+        };
+        let rec = record_of(&b).unwrap();
+        assert_eq!((rec.state, rec.stop_epoch), (State::Stopped, 8));
+        assert_eq!(rec.kind, Kind::Refusal { request_digest: [0x33; 32] });
+    }
+
+    #[test]
+    fn a_release_opens_only_its_own_epoch_on_its_own_device() {
+        for (dev, ep, at) in [("device-A", 6u64, 8u64), ("device-A", 10, 8), ("device-B", 8, 8)] {
+            let r = FakeRelease::signed(dev, ep);
+            let a = admit(&Fake::at(at), &ctx_with(&r), [0; 32]).unwrap();
+            assert!(matches!(a, Admission::Refuse(_)), "{dev} {ep} must not open {at}");
+        }
+        let r = FakeRelease::signed("device-A", 8);
+        assert_eq!(admit(&Fake::at(8), &ctx_with(&r), [0; 32]).unwrap(), Admission::Allow);
+    }
+
+    #[test]
+    fn an_altered_release_does_not_open() {
+        let r = FakeRelease::signed("device-A", 8);
+        {
+            let mut f = r.files.borrow_mut();
+            let (rec, _) = f.as_mut().unwrap();
+            rec.push(b' ');
+        }
+        assert!(matches!(admit(&Fake::at(8), &ctx_with(&r), [0; 32]).unwrap(), Admission::Refuse(_)));
+    }
+
+    #[test]
+    fn an_unreadable_release_is_an_error_not_an_allow() {
+        let r = FakeRelease::signed("device-A", 8);
+        r.fail.set(true);
+        assert!(admit(&Fake::at(8), &ctx_with(&r), [0; 32]).is_err());
+    }
+
+    #[test]
+    fn recover_without_a_valid_release_changes_nothing() {
+        for r in [FakeRelease::none(), FakeRelease::signed("device-A", 4), FakeRelease::signed("device-B", 6)] {
+            let t = Fake::at(5);
+            let e = recover(&t, &lift(&r)).unwrap_err();
+            assert!(e.message.contains("epoch 6"), "{}", e.message);
+            assert_eq!(e.now, Some(5));
+            assert_eq!(t.counter.get(), 5, "no increment without a release");
+        }
+    }
+
+    #[test]
+    fn a_used_release_does_not_lift_the_next_stop() {
+        let t = Fake::at(5);
+        let r = FakeRelease::signed("device-A", 6);
+        recover(&t, &lift(&r)).unwrap();
+        assert_eq!(admit(&t, &ctx_with(&r), [0; 32]).unwrap(), Admission::Allow);
+        trip(&t).unwrap();
+        assert!(recover(&t, &lift(&r)).is_err(), "the release for 6 does not name 8");
+        assert_eq!(t.counter.get(), 7);
+    }
+
+    #[test]
+    fn recover_on_an_even_counter_without_its_release_fails_and_says_stopped() {
+        let t = Fake::at(8);
+        let e = recover(&t, &lift(&FakeRelease::none())).unwrap_err();
+        assert!(e.message.contains("epoch 8"), "{}", e.message);
+        assert_eq!(t.counter.get(), 8);
+        let r = FakeRelease::signed("device-A", 8);
+        assert_eq!(recover(&t, &lift(&r)).unwrap(), Transition::AlreadyThere { at: 8 });
+    }
+
+    #[test]
+    fn trip_needs_no_release() {
+        let t = Fake::at(8);
+        assert_eq!(trip(&t).unwrap(), Transition::Changed { from: 8, to: 9 });
     }
 
     #[test]

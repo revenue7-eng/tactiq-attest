@@ -22,6 +22,54 @@ pub trait StopTpm {
     fn quote(&self, qualifying: &[u8; 32], spec: &str) -> R<(Vec<u8>, Vec<u8>)>;
 }
 
+/// Where the operator's release is read from. `None` when there is none:
+/// that is a stop, not an error. Any other failure to read is an error, and
+/// the caller denies.
+pub trait ReleaseStore {
+    /// (record, signature), each read whole and at most `limit` bytes.
+    fn read(&self) -> R<Option<(Vec<u8>, Vec<u8>)>>;
+}
+
+/// The release files on the device, read on every check: a release that is
+/// removed or replaced takes effect on the next call, and nothing is cached.
+pub struct ReleaseFiles {
+    pub record: &'static str,
+    pub sig: &'static str,
+}
+
+impl ReleaseStore for ReleaseFiles {
+    fn read(&self) -> R<Option<(Vec<u8>, Vec<u8>)>> {
+        let rec = match read_bounded(Path::new(self.record), crate::release::MAX_RECORD)? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        match read_bounded(Path::new(self.sig), crate::release::MAX_SIG)? {
+            Some(sig) => Ok(Some((rec, sig))),
+            // A record without its signature is no release.
+            None => Ok(None),
+        }
+    }
+}
+
+/// The whole file if it exists and is at most `limit` bytes; `None` if it
+/// does not exist. A longer file is an error rather than a truncated read.
+fn read_bounded(p: &Path, limit: usize) -> R<Option<Vec<u8>>> {
+    use std::io::Read;
+    let f = match std::fs::File::open(p) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {}: {e}", p.display())),
+    };
+    let mut buf = Vec::new();
+    f.take(limit as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read {}: {e}", p.display()))?;
+    if buf.len() > limit {
+        return Err(format!("{}: more than {limit} bytes", p.display()));
+    }
+    Ok(Some(buf))
+}
+
 /// The chip, through `attest-tpm` and tpm2-tools. `scratch` must be a
 /// directory private to this process: the tools write their outputs there.
 pub struct Real<'a> {
@@ -67,11 +115,40 @@ pub mod fake {
     //! helper), so the service's own check of it runs as it would on a chip.
     //! Failure switches cover the paths the first version left untested.
 
-    use super::{StopTpm, R};
+    use super::{ReleaseStore, StopTpm, R};
     use attest_stop::{build_nv_certify_info_for_tests, NvCertifyInfo};
     use std::cell::{Cell, RefCell};
 
     pub const INDEX_NAME: [u8; 4] = [0x00, 0x0b, 0x15, 0x17];
+
+    /// A release held in memory; `fail` makes every read an error.
+    #[derive(Default)]
+    pub struct FakeRelease {
+        pub files: RefCell<Option<(Vec<u8>, Vec<u8>)>>,
+        pub fail: Cell<bool>,
+    }
+
+    impl FakeRelease {
+        pub fn none() -> Self {
+            Self::default()
+        }
+        pub fn signed(device: &str, epoch: u64) -> Self {
+            let r = crate::release::testkey::record(device, epoch);
+            let s = crate::release::testkey::sign(&r);
+            let f = Self::default();
+            *f.files.borrow_mut() = Some((r, s));
+            f
+        }
+    }
+
+    impl ReleaseStore for FakeRelease {
+        fn read(&self) -> R<Option<(Vec<u8>, Vec<u8>)>> {
+            if self.fail.get() {
+                return Err("fake: release unreadable".into());
+            }
+            Ok(self.files.borrow().clone())
+        }
+    }
 
     pub struct Fake {
         pub counter: Cell<u64>,

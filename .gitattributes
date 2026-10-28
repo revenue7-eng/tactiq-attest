@@ -11,3 +11,7 @@ tools/registrar/tests/fixtures/**/*.blob binary
 # the .p7s files nor the signed .json may be rewritten on checkout.
 tools/registrar/tests/fixtures/signature/** binary
 tools/registrar/tests/fixtures/**/*.crl binary
+# Release fixtures of the stop service: release.sig covers the exact bytes of
+# release, so neither may be rewritten on checkout.
+crates/stop/testdata/release binary
+crates/stop/testdata/release.sig binary
