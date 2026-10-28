@@ -1,0 +1,25 @@
+[package]
+name = "stop-verify"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Checks a stop receipt of tactiq-stop away from the device"
+publish = false
+
+# A workspace of its own, like the registrar: it runs on the operator's or
+# auditor's machine, never on a device, and the agent recipe in tactiq-os
+# vendors every crate of the root lock file.
+[workspace]
+
+[[bin]]
+name = "tactiq-stop-verify"
+path = "src/main.rs"
+
+[dependencies]
+# The check itself is attest-appraise's, the same code a browser or the
+# appliance runs; this tool only reads files and prints.
+attest-appraise = { path = "../../crates/attest-appraise" }
+attest-envelope = { path = "../../crates/attest-envelope" }
+attest-stop = { path = "../../crates/attest-stop" }
+serde_json = "1"
+sha2 = "0.10"

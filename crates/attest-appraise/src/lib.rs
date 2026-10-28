@@ -8,12 +8,16 @@
 //! What this crate answers: was this envelope signed by this key, is its bundle
 //! the one that was signed over, and was the device state in the reference set
 //! when it signed. What it does not answer: is this the device's latest envelope.
+//!
+//! Also the check of a stop receipt from the agent stop service
+//! ([`verify_stop_receipt`]): who says the agent is stopped, and since when.
 
 mod appraisal;
 mod evidence;
 mod gate1;
 mod reference;
 mod rim;
+mod stop;
 mod verdict;
 
 pub use appraisal::{appraise, check};
@@ -24,6 +28,7 @@ pub use gate1::{
 };
 pub use reference::{AttestedState, PcrHash, PcrSelection, ReferenceSet};
 pub use rim::reference_from_rim;
+pub use stop::{verify_stop_receipt, StopBasis, StopFinding, StopTrust};
 pub use verdict::{Outcome, Reason, Verdict};
 
 #[cfg(test)]

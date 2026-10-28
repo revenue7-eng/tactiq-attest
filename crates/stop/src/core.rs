@@ -65,7 +65,7 @@ pub fn gate(lift: &Lift, counter: u64) -> R<Gate> {
         return Ok(Gate::Stopped);
     }
     Ok(match lift.release.read()? {
-        None => Gate::Unreleased(format!("no operator release for epoch {counter}")),
+        None => Gate::Unreleased("no operator release on the device".into()),
         Some((rec, sig)) => match release::check(lift.operator_key, &rec, &sig, lift.device_id, counter) {
             Ok(()) => Gate::Open,
             Err(e) => Gate::Unreleased(e),
@@ -574,5 +574,13 @@ mod tests {
     #[test]
     fn receipt_message_width_matches_the_envelope() {
         assert_eq!(attest_stop::RECEIPT_MSG_LEN, MSG_LEN);
+    }
+
+    #[test]
+    fn the_counter_the_device_defines_is_the_one_a_verifier_names() {
+        // attest-tpm defines the counter; attest-stop computes its name for
+        // verifiers. One definition, checked here where both are in reach.
+        assert_eq!(attest_tpm::STOP_NV_COUNTER, format!("0x{:x}", attest_stop::STOP_NV_INDEX));
+        assert_eq!(attest_tpm::STOP_NV_ATTRIBUTES | (1 << 29), attest_stop::STOP_NV_ATTRIBUTES_WRITTEN);
     }
 }

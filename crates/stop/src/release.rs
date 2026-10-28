@@ -118,10 +118,10 @@ pub fn check(key: &OperatorKey, record: &[u8], sig_der: &[u8], device_id: &str, 
         .map_err(|_| "release: signature does not verify against the operator key".to_string())?;
     let r = parse(record)?;
     if r.device_id != device_id {
-        return Err(format!("release: for device {}, this is {device_id}", r.device_id));
+        return Err(format!("release names device {}, this device is {device_id}", r.device_id));
     }
     if r.epoch != epoch {
-        return Err(format!("release: for epoch {}, the counter is at {epoch}", r.epoch));
+        return Err(format!("release names epoch {}, the epoch needed is {epoch}", r.epoch));
     }
     Ok(())
 }
