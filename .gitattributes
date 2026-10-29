@@ -18,3 +18,5 @@ crates/stop/testdata/release.sig binary
 # Stop receipts and keys from swtpm: TPM signatures over exact bytes.
 crates/attest-appraise/tests/fixtures/stop/*.tqsr binary
 crates/attest-appraise/tests/fixtures/stop/*.pub binary
+# The stop sample: a TPM-signed receipt over exact bytes.
+docs/stop-sample/*.tqsr binary
