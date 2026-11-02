@@ -26,10 +26,13 @@
 //! that value verifies, so a counter moved around `recover` stays a stop.
 //!
 //! Known limits of this version, stated rather than hidden:
-//!   * the counter is written with the owner hierarchy, whose auth is empty
-//!     on TactiQ OS, so any process with TPM access can trip, or move the
-//!     counter to a value no release names, which is also a stop. Without the
-//!     operator's key it cannot make a call pass;
+//!   * the counter is written with its own empty auth, so any process with
+//!     TPM access can trip, or move the counter to a value no release names,
+//!     which is also a stop. Without the operator's key it cannot make a call
+//!     pass. Neither the service nor the operator commands use the owner
+//!     hierarchy at run time, so its authorization can be set at provisioning
+//!     and kept off the device; until it is, the owner can still delete and
+//!     redefine the index (which, again, ends stopped);
 //!   * the AK is shared with tactiq-agent and has no authorization, so a
 //!     valid receipt proves the device and its measured build, not which
 //!     process on it asked for the signatures;

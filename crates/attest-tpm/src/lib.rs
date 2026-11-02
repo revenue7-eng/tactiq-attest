@@ -51,23 +51,34 @@ pub const DEFAULT_NV_COUNTER: &str = "0x1500016";
 /// stop state is its parity (odd = stopped). Mixing the two would let an
 /// agent restart flip the stop state.
 ///
-/// Defined `authread`, so it is read and certified with the index's own empty
-/// auth and the reader needs no owner authorization; writes stay with the
-/// owner hierarchy.
+/// Defined `authread|authwrite`, so it is read, certified and incremented
+/// with the index's own empty auth: neither the service nor the operator
+/// commands need the owner hierarchy at run time. Anyone with TPM access can
+/// therefore trip it, which is the intended lockout rule; lifting a stop takes
+/// the operator's signed release, not a write to this index.
 ///
 /// Fixed, not configurable: the service and the operator commands are
 /// separate processes, and an environment variable that differed between
 /// them would let `trip` advance one index while the service reads another.
 pub const STOP_NV_COUNTER: &str = "0x1500017";
 
-/// The exact attribute set of the stop counter, ignoring TPMA_NV_WRITTEN:
-/// counter type, owner write, owner read, auth read. Anything else (orderly,
-/// policy write, no-DA, platform-created, ...) is a different index than the
-/// one this code was written for, and is refused.
-pub const STOP_NV_ATTRIBUTES: u32 = TPM_NT_COUNTER | TPMA_NV_OWNERWRITE | TPMA_NV_OWNERREAD | TPMA_NV_AUTHREAD;
-const TPMA_NV_OWNERWRITE: u32 = 1 << 1;
-const TPMA_NV_OWNERREAD: u32 = 1 << 17;
+/// The exact attribute set of both counters (the agent's epoch counter and
+/// the stop counter), ignoring TPMA_NV_WRITTEN: counter type, auth write,
+/// auth read. Anything else (owner write, orderly, policy write, no-DA,
+/// platform-created, ...) is a different index than the one this code was
+/// written for, and is refused.
+///
+/// No owner bits, so that the owner authorization can be set at provisioning
+/// and kept off the device: with it set, root can no longer evict the AK,
+/// delete or redefine either counter, or move the TPM clock
+/// (TPM2_ClockSet, TPM2_ClockRateAdjust).
+pub const COUNTER_NV_ATTRIBUTES: u32 = TPM_NT_COUNTER | TPMA_NV_AUTHWRITE | TPMA_NV_AUTHREAD;
+/// The stop counter's attribute set: the same as the epoch counter's.
+pub const STOP_NV_ATTRIBUTES: u32 = COUNTER_NV_ATTRIBUTES;
+const TPMA_NV_AUTHWRITE: u32 = 1 << 2;
 const TPMA_NV_AUTHREAD: u32 = 1 << 18;
+/// `tpm2_nvdefine -a` for `COUNTER_NV_ATTRIBUTES`.
+const COUNTER_NV_ATTRIBUTES_ARG: &str = "nt=counter|authread|authwrite";
 const TPMA_NV_WRITTEN: u32 = 1 << 29;
 
 /// Persistent handle of the AK: `TACTIQ_AK_HANDLE`, default
@@ -309,14 +320,14 @@ pub fn verify_ak(recorded: &Path, work: &Path) -> R<()> {
 /// Define the monotonic counter. A TPM NV counter can be incremented and read
 /// but never set or rolled back, which is what makes freshness work without a
 /// nonce, a clock, or a network round trip.
+///
+/// Defining takes the owner authorization (provisioning); incrementing and
+/// reading take only the index's own empty auth (`COUNTER_NV_ATTRIBUTES`).
 pub fn nv_define() -> R<()> {
     let nv = nv_counter()?;
-    run_owner(&[
-        "tpm2_nvdefine", &nv, "-C", "o",
-        "-a", "nt=counter|ownerread|ownerwrite",
-    ])?;
+    run_owner(&["tpm2_nvdefine", &nv, "-C", "o", "-a", COUNTER_NV_ATTRIBUTES_ARG])?;
     // A freshly defined counter is not readable until first increment.
-    run_owner(&["tpm2_nvincrement", &nv, "-C", "o"])?;
+    run(&["tpm2_nvincrement", &nv, "-C", &nv])?;
     Ok(())
 }
 
@@ -337,13 +348,28 @@ pub fn check_counter_attributes(attrs: u32) -> R<()> {
     if attrs & TPMA_NV_ORDERLY != 0 {
         return Err(format!(
             "{nv} is orderly (attributes 0x{attrs:08x}): its value can roll \
-             back after a power cut, so it cannot carry the epoch. Recreate it \
-             without orderly: tpm2_nvundefine {nv} -C o; tpm2_nvdefine \
-             {nv} -C o -a \"nt=counter|ownerread|ownerwrite\"; \
-             tpm2_nvincrement {nv} -C o"
+             back after a power cut, so it cannot carry the epoch. {}",
+            recreate_hint(&nv)
+        ));
+    }
+    if attrs & !TPMA_NV_WRITTEN != COUNTER_NV_ATTRIBUTES {
+        return Err(format!(
+            "{nv} has attributes 0x{attrs:08x}; the epoch counter must be exactly \
+             0x{COUNTER_NV_ATTRIBUTES:08x} (counter, authwrite, authread), plus written. \
+             An index from before this version is written by the owner. {}",
+            recreate_hint(&nv)
         ));
     }
     Ok(())
+}
+
+/// How to replace a counter index this code refuses, while the owner
+/// authorization is still empty (or with `-P` once it is set).
+fn recreate_hint(nv: &str) -> String {
+    format!(
+        "Recreate it: tpm2_nvundefine {nv} -C o; tpm2_nvdefine {nv} -C o -a \
+         \"{COUNTER_NV_ATTRIBUTES_ARG}\"; tpm2_nvincrement {nv} -C {nv}"
+    )
 }
 
 /// The `value:` of the `attributes:` block in `tpm2_nvreadpublic <index>`
@@ -385,10 +411,10 @@ pub fn verify_counter() -> R<()> {
 /// they race.
 pub fn nv_increment_and_read(work: &Path) -> R<u64> {
     let nv = nv_counter()?;
-    run_owner(&["tpm2_nvincrement", &nv, "-C", "o"])?;
+    run(&["tpm2_nvincrement", &nv, "-C", &nv])?;
     let f = work.join("counter.bin");
     let fs_ = f.to_string_lossy().to_string();
-    run_owner(&["tpm2_nvread", &nv, "-C", "o", "-o", &fs_])?;
+    run(&["tpm2_nvread", &nv, "-C", &nv, "-o", &fs_])?;
     let raw = std::fs::read(&f).map_err(|e| format!("read counter: {e}"))?;
     if raw.len() != 8 {
         return Err(format!("counter is {} bytes, expected 8", raw.len()));
@@ -398,16 +424,14 @@ pub fn nv_increment_and_read(work: &Path) -> R<u64> {
     Ok(u64::from_be_bytes(b))
 }
 
-/// Define the stop counter: a non-orderly counter, written by the owner,
-/// read with its own (empty) auth. The first increment makes it readable.
+/// Define the stop counter: a non-orderly counter, defined by the owner,
+/// written and read with its own (empty) auth. The first increment makes it
+/// readable.
 /// Its value after that is chosen by the TPM (the highest value any counter
 /// on this TPM has held), so its parity, and with it the initial stop state,
 /// is not known in advance: the caller reads it and sets the state it wants.
 pub fn stop_nv_define() -> R<()> {
-    run_owner(&[
-        "tpm2_nvdefine", STOP_NV_COUNTER, "-C", "o",
-        "-a", "nt=counter|ownerwrite|ownerread|authread",
-    ])?;
+    run_owner(&["tpm2_nvdefine", STOP_NV_COUNTER, "-C", "o", "-a", COUNTER_NV_ATTRIBUTES_ARG])?;
     stop_nv_first_write()
 }
 
@@ -416,7 +440,9 @@ pub fn check_stop_attributes(attrs: u32) -> R<()> {
     if attrs & !TPMA_NV_WRITTEN != STOP_NV_ATTRIBUTES {
         return Err(format!(
             "{STOP_NV_COUNTER} has attributes 0x{attrs:08x}; the stop counter must be exactly \
-             0x{STOP_NV_ATTRIBUTES:08x} (counter, ownerwrite, ownerread, authread), plus written"
+             0x{STOP_NV_ATTRIBUTES:08x} (counter, authwrite, authread), plus written. \
+             An index from before this version is written by the owner. {}",
+            recreate_hint(STOP_NV_COUNTER)
         ));
     }
     Ok(())
@@ -441,7 +467,7 @@ pub fn stop_attributes_written(attrs: u32) -> bool {
 
 /// First increment of a defined but never written stop counter.
 pub fn stop_nv_first_write() -> R<()> {
-    run_owner(&["tpm2_nvincrement", STOP_NV_COUNTER, "-C", "o"])?;
+    run(&["tpm2_nvincrement", STOP_NV_COUNTER, "-C", STOP_NV_COUNTER])?;
     Ok(())
 }
 
@@ -483,9 +509,9 @@ pub fn stop_nv_read() -> R<u64> {
     Ok(u64::from_be_bytes(b))
 }
 
-/// Advance the stop counter by one. Owner-authorized.
+/// Advance the stop counter by one, with the index's own (empty) auth.
 pub fn stop_nv_increment() -> R<()> {
-    run_owner(&["tpm2_nvincrement", STOP_NV_COUNTER, "-C", "o"])?;
+    run(&["tpm2_nvincrement", STOP_NV_COUNTER, "-C", STOP_NV_COUNTER])?;
     Ok(())
 }
 
@@ -635,8 +661,20 @@ mod tests {
 
     #[test]
     fn counter_without_orderly_is_accepted() {
-        // nt=counter|ownerread|ownerwrite|written, as nv_define creates it.
-        check_counter_attributes(0x2002_0012).unwrap();
+        // authwrite|nt=0x1|authread|written, as nv_define creates it
+        // (tpm2_nvreadpublic on swtpm 0.7.3).
+        check_counter_attributes(0x2004_0014).unwrap();
+    }
+
+    #[test]
+    fn owner_written_counter_is_refused() {
+        // nt=counter|ownerread|ownerwrite|written: the index of earlier
+        // versions, which needs the owner authorization at every start.
+        let e = check_counter_attributes(0x2002_0012).unwrap_err();
+        assert!(e.contains("Recreate it"), "{e}");
+        // auth bits plus an owner bit is still another index.
+        check_counter_attributes(0x2004_0014 | (1 << 1)).unwrap_err();
+        check_counter_attributes(0x2004_0014 & !(1 << 18)).unwrap_err();
     }
 
     #[test]
@@ -763,13 +801,15 @@ mod stop_tests {
 
     #[test]
     fn stop_attributes_must_match_exactly() {
-        assert_eq!(STOP_NV_ATTRIBUTES, 0x0006_0012);
+        assert_eq!(STOP_NV_ATTRIBUTES, 0x0004_0014);
         assert!(check_stop_attributes(STOP_NV_ATTRIBUTES).is_ok());
         assert!(check_stop_attributes(STOP_NV_ATTRIBUTES | TPMA_NV_WRITTEN).is_ok());
         assert!(check_stop_attributes(STOP_NV_ATTRIBUTES | TPMA_NV_ORDERLY).is_err());
         assert!(check_stop_attributes(STOP_NV_ATTRIBUTES | (1 << 25)).is_err(), "no_da");
         assert!(check_stop_attributes(STOP_NV_ATTRIBUTES & !TPMA_NV_AUTHREAD).is_err());
         assert!(check_stop_attributes(0).is_err());
+        // the owner-written stop counter of earlier versions
+        assert!(check_stop_attributes(0x2006_0012).is_err());
     }
 
     #[test]
