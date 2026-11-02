@@ -64,11 +64,20 @@ You need Rust, OpenSSL and tpm2-tools (for the release script only).
    `8E:10:04:1E:BB:FC:CB:A0:36:62:1B:2E:45:36:87:D2:9A:50:D7:15:65:F2:99:CB:41:28:B4:CE:B9:65:FF:E8`
    (`openssl x509 -in release-root-r2.pem -noout -fingerprint -sha256`).
 
-3. The receipt:
+3. The receipt, with the verifier at `b9874bf`.
+
+   The board answered with the stop counter of that version, an index the
+   owner hierarchy writes. Since `3c57e1f` (#29) the counter is defined with
+   other attributes so that the owner authorization can be closed, and its TPM
+   name changed with them. The verifier on `main` checks the name it computes
+   for the new index, so it refuses this receipt with `certifies a different
+   NV index`. That refusal is correct for a device on the new version; this
+   receipt is checked by the verifier of the version that made it:
 
    ```
-   (cd tools/stop-verify && cargo build --release)
-   tools/stop-verify/target/release/tactiq-stop-verify check docs/stop-sample/receipt-loto3.tqsr \
+   git worktree add ../tactiq-attest-b9874bf b9874bf
+   (cd ../tactiq-attest-b9874bf/tools/stop-verify && cargo build --release)
+   ../tactiq-attest-b9874bf/tools/stop-verify/target/release/tactiq-stop-verify check docs/stop-sample/receipt-loto3.tqsr \
      --ak ak.pub --device TACTIQ-BENCH-001 \
      --pcr-ref docs/stop-sample/pcr-ref-op1-20261028.json --slot A \
      --nonce $(cat docs/stop-sample/nonce-loto3.txt)
@@ -90,7 +99,7 @@ You need Rust, OpenSSL and tpm2-tools (for the release script only).
    Exit 0 is stopped, 2 running, 1 refused.
 
 4. The check must be able to fail. Each of these gives `VERDICT REFUSED`:
-   another nonce (`--nonce $(tools/stop-verify/target/release/tactiq-stop-verify nonce)`),
+   another nonce (`--nonce $(../tactiq-attest-b9874bf/tools/stop-verify/target/release/tactiq-stop-verify nonce)`),
    the other slot (`--slot B`), another device id, or one byte of the receipt
    changed.
 
