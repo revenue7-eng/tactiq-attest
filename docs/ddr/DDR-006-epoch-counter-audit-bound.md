@@ -80,6 +80,10 @@ handed out twice across agent restarts and reboots.
   agent runs, with the attributes `nv_define()` uses: `tpm2_nvundefine
   0x1500016 -C o`, `tpm2_nvdefine 0x1500016 -C o -a
   "nt=counter|ownerread|ownerwrite"`, `tpm2_nvincrement 0x1500016 -C o`.
+  (Later change: the counter no longer uses the owner hierarchy at run time.
+  It is defined `nt=counter|authread|authwrite` and incremented and read with
+  its own empty auth, `-C 0x1500016`; an owner-written index is refused with
+  the commands to recreate it. See `COUNTER_NV_ATTRIBUTES` in `attest-tpm`.)
   `provision` cannot do it on a provisioned device, because it refuses to run
   there. New devices get the right index from `provision` as before.
 - Envelope file names stay 12 digits up to epoch 59 604. Past that they grow

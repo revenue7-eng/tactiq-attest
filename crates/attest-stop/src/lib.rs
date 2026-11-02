@@ -77,9 +77,14 @@
 //!
 //! Nor does a receipt reveal an owner who deleted and redefined the stop
 //! index: with the same attributes the index name is the same, and the new
-//! counter continues from the TPM's highest value, so the result reads like
-//! an ordinary `recover`. Closing that is the job of an operator policy on
-//! the index (with `POLICY_DELETE`), which the stop service does not have yet.
+//! counter continues from the TPM's highest value. That cannot make a call
+//! pass: the stop service lets calls through only at an even value the
+//! operator's release names, and a redefined counter lands at best on an
+//! epoch with no release, which is stopped. Deleting the index at all takes
+//! the owner authorization; set at provisioning and kept off the device, it
+//! closes that path. (`POLICY_DELETE` is not the way: a TPM defines such an
+//! index only under the platform hierarchy, which TactiQ OS disables before
+//! the OS starts.)
 //!
 //! Receipt
 //! -------
@@ -514,10 +519,9 @@ pub fn check_counter_certify(
 
 /// TPM handle of the stop counter.
 pub const STOP_NV_INDEX: u32 = 0x0150_0017;
-/// Its attribute word once written: counter, ownerwrite, ownerread, authread,
-/// written. The device defines it with exactly these (`attest-tpm`, whose
+/// Its attribute word once written: counter, authwrite, authread, written. The device defines it with exactly these (`attest-tpm`, whose
 /// constant a test in the stop service pins to this one).
-pub const STOP_NV_ATTRIBUTES_WRITTEN: u32 = 0x2006_0012;
+pub const STOP_NV_ATTRIBUTES_WRITTEN: u32 = 0x2004_0014;
 
 /// TPM name of the stop counter: `sha256 alg id || SHA-256(TPMS_NV_PUBLIC)`,
 /// over index, nameAlg sha256, the attribute word above, an empty auth
@@ -603,9 +607,10 @@ mod tests {
 
     #[test]
     fn the_stop_index_name_is_the_one_a_tpm_reports() {
-        // `tpm2_nvdefine 0x1500017 -C o -a "nt=counter|ownerwrite|ownerread|authread"`,
-        // one `tpm2_nvincrement`, then `tpm2_nvreadpublic 0x1500017` on swtpm 0.7.3.
-        let want = "000b3284b95a75e1ef9c345dfb42509d967df6966347b65f5831d46f3d8efa2bc737";
+        // `tpm2_nvdefine 0x1500017 -C o -a "nt=counter|authread|authwrite"`,
+        // one `tpm2_nvincrement 0x1500017 -C 0x1500017`, then
+        // `tpm2_nvreadpublic 0x1500017` on swtpm 0.7.3.
+        let want = "000beb76be7d77c070f0b50ea315e2b3c0cc7d427d721b95e573ab9fb5fca3793776";
         let got: String = stop_index_name().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, want);
     }

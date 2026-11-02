@@ -17,10 +17,11 @@ use crate::release::{self, OperatorKey};
 /// The parity of the stop counter: odd = stopped. Trip and recover each
 /// advance it by one, so the parity changes only by an increment.
 ///
-/// Parity alone does not let a call through. Anyone who can write the index
-/// (the owner hierarchy, whose auth is empty on TactiQ OS) can advance it,
-/// and the owner can delete and redefine it, so an even counter is running
-/// only with the operator's release for that exact value (`gate`).
+/// Parity alone does not let a call through. Anyone with TPM access can
+/// advance the index (it is written with its own empty auth), and while the
+/// owner authorization is empty the owner can delete and redefine it, so an
+/// even counter is running only with the operator's release for that exact
+/// value (`gate`).
 pub fn state_of(counter: u64) -> State {
     if counter.is_multiple_of(2) {
         State::Running
