@@ -132,3 +132,7 @@ dates of October, `r4` earlier than `r1`). The check does not read it.
 The TPM clock gave about thirteen minutes for a gap of about ten by the
 operator's watch; it is not wall time and the result is not read as a
 duration.
+
+The receipts, the challenges, the raw output of each check and a script that
+runs them again are the measurement record
+`measurements/stop-interval-board-20261104.md` in tactiq-os (#299).
