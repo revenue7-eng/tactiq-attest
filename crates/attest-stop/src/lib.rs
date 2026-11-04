@@ -440,12 +440,38 @@ pub const TPM_GENERATED: u32 = 0xFF54_4347;
 /// `TPM_ST_ATTEST_NV`.
 pub const ST_ATTEST_NV: u16 = 0x8014;
 
+/// `TPMS_CLOCK_INFO` of a TPM-signed structure: when, by the TPM's own clock,
+/// the TPM produced it.
+///
+/// `clock` counts milliseconds while the TPM is powered, from its last
+/// `TPM2_Clear`; it is not wall time, and the owner or platform can move it
+/// forward (`TPM2_ClockSet`), never back. `reset_count` grows at every TPM
+/// reset (a reboot), `restart_count` at every restart (a resume) and returns
+/// to 0 at a reset. With the AK in the endorsement hierarchy (DDR-005
+/// decision 3) the TPM reports both counts in the clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TpmClock {
+    pub clock: u64,
+    pub reset_count: u32,
+    pub restart_count: u32,
+    pub safe: bool,
+}
+
+impl TpmClock {
+    /// The same TPM boot: no reset and no restart between the two.
+    pub fn same_boot(&self, other: &TpmClock) -> bool {
+        self.reset_count == other.reset_count && self.restart_count == other.restart_count
+    }
+}
+
 /// The fields of a `TPMS_ATTEST` of type `TPM_ST_ATTEST_NV` that a check of
 /// the stop counter needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NvCertifyInfo {
     pub qualified_signer: Vec<u8>,
     pub extra_data: Vec<u8>,
+    /// When the TPM read the counter, by its clock.
+    pub clock: TpmClock,
     pub index_name: Vec<u8>,
     pub offset: u16,
     pub contents: Vec<u8>,
@@ -473,7 +499,16 @@ pub fn parse_nv_certify_info(attest: &[u8]) -> Result<NvCertifyInfo, String> {
     }
     let qualified_signer = r.tpm2b()?.to_vec();
     let extra_data = r.tpm2b()?.to_vec();
-    r.skip(17)?; // clockInfo: clock(8) resetCount(4) restartCount(4) safe(1)
+    let clock = TpmClock {
+        clock: r.u64()?,
+        reset_count: r.u32()?,
+        restart_count: r.u32()?,
+        safe: match r.take(1)?[0] {
+            0 => false,
+            1 => true,
+            v => return Err(format!("nv certify: safe = {v}, want 0 or 1")),
+        },
+    };
     r.skip(8)?; // firmwareVersion
     let index_name = r.tpm2b()?.to_vec();
     let offset = r.u16()?;
@@ -481,7 +516,7 @@ pub fn parse_nv_certify_info(attest: &[u8]) -> Result<NvCertifyInfo, String> {
     if !r.b.is_empty() {
         return Err(format!("nv certify: {} trailing bytes", r.b.len()));
     }
-    Ok(NvCertifyInfo { qualified_signer, extra_data, index_name, offset, contents })
+    Ok(NvCertifyInfo { qualified_signer, extra_data, clock, index_name, offset, contents })
 }
 
 /// Check that a certify says what the record says: bound to `qualifying`,
@@ -574,6 +609,11 @@ impl<'a> Be<'a> {
         let h = self.take(4)?;
         Ok(u32::from_be_bytes([h[0], h[1], h[2], h[3]]))
     }
+    fn u64(&mut self) -> Result<u64, String> {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(self.take(8)?);
+        Ok(u64::from_be_bytes(b))
+    }
     fn tpm2b(&mut self) -> Result<&'a [u8], String> {
         let n = self.u16()? as usize;
         self.take(n)
@@ -591,7 +631,10 @@ pub fn build_nv_certify_info_for_tests(info: &NvCertifyInfo) -> Vec<u8> {
         o.extend_from_slice(&(part.len() as u16).to_be_bytes());
         o.extend_from_slice(part);
     }
-    o.extend_from_slice(&[0x11; 17]);
+    o.extend_from_slice(&info.clock.clock.to_be_bytes());
+    o.extend_from_slice(&info.clock.reset_count.to_be_bytes());
+    o.extend_from_slice(&info.clock.restart_count.to_be_bytes());
+    o.push(info.clock.safe as u8);
     o.extend_from_slice(&[0x22; 8]);
     o.extend_from_slice(&(info.index_name.len() as u16).to_be_bytes());
     o.extend_from_slice(&info.index_name);
@@ -793,6 +836,7 @@ mod tests {
         NvCertifyInfo {
             qualified_signer: vec![0x00, 0x0b, 0xAA, 0xBB],
             extra_data: qd.to_vec(),
+            clock: TpmClock { clock: 0x0102_0304_0506, reset_count: 7, restart_count: 2, safe: true },
             index_name: vec![0x00, 0x0b, 0x01, 0x02],
             offset: 0,
             contents: epoch.to_be_bytes().to_vec(),
@@ -819,6 +863,28 @@ mod tests {
         x.push(0);
         assert!(parse_nv_certify_info(&x).is_err());
         assert!(parse_nv_certify_info(&b[..b.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn nv_certify_clock_is_read_where_the_tpm_puts_it() {
+        let i = info(5, [7; 32]);
+        let b = build_nv_certify_info_for_tests(&i);
+        // magic(4) type(2) signer(2+4) extra(2+32): clockInfo starts at 46.
+        assert_eq!(&b[46..54], &0x0102_0304_0506u64.to_be_bytes());
+        assert_eq!(&b[54..58], &7u32.to_be_bytes());
+        assert_eq!(&b[58..62], &2u32.to_be_bytes());
+        assert_eq!(parse_nv_certify_info(&b).unwrap().clock, i.clock);
+        let mut bad = b.clone();
+        bad[62] = 2; // TPMI_YES_NO is 0 or 1
+        assert!(parse_nv_certify_info(&bad).is_err());
+    }
+
+    #[test]
+    fn same_boot_needs_both_counts() {
+        let c = TpmClock { clock: 10, reset_count: 4, restart_count: 1, safe: true };
+        assert!(c.same_boot(&TpmClock { clock: 99, ..c }));
+        assert!(!c.same_boot(&TpmClock { reset_count: 5, ..c }));
+        assert!(!c.same_boot(&TpmClock { restart_count: 2, ..c }));
     }
 
     #[test]

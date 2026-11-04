@@ -3,6 +3,7 @@
 //!
 //!   nonce   print a fresh 32-byte challenge, hex, from the OS
 //!   check   check a receipt from `tactiq-stop status <nonce>` (or a 403 body)
+//!   interval  check that a stop held from one status receipt to a later one
 //!
 //! The round trip on an air-gapped site: `nonce` here, the hex carried to the
 //! device, `tactiq-stop status <hex> > receipt` there, the receipt carried
@@ -22,12 +23,18 @@
 //!   --nonce HEX      the challenge sent; `--no-nonce` for a 403 body, which
 //!                    proves what the service said but not when.
 //!
-//! Exit status: 0 verified and stopped, 2 verified and running, 1 refused.
+//! `interval FIRST SECOND` takes the same `--ak`, `--device`, `--pcr-ref` and
+//! `--slot`, and the two challenges as `--nonce-first` and `--nonce-second`.
+//! Ask the second only after the first receipt is back: then the second
+//! answer was made after the first was checked, whatever the device claims.
+//!
+//! Exit status: 0 verified and stopped (`interval`: the stop held), 2 verified
+//! and running, 1 refused.
 
 use std::fs;
 use std::process::ExitCode;
 
-use attest_appraise::{verify_stop_receipt, AkKey, StopBasis, StopTrust};
+use attest_appraise::{verify_stop_interval, verify_stop_receipt, AkKey, StopBasis, StopTrust};
 use attest_envelope::{encode_pcr_selection, DEVICE_ID_LEN};
 use attest_stop::{Kind, NONCE_MAX, NONCE_MIN};
 use sha2::{Digest, Sha256};
@@ -42,6 +49,7 @@ fn main() -> ExitCode {
     let r = match args.first().map(String::as_str) {
         Some("nonce") if args.len() == 1 => nonce().map(|()| 0),
         Some("check") => check(&args[1..]),
+        Some("interval") => interval(&args[1..]),
         _ => Err(USAGE.into()),
     };
     match r {
@@ -55,7 +63,8 @@ fn main() -> ExitCode {
 }
 
 const USAGE: &str = "usage:\n  tactiq-stop-verify nonce\n  tactiq-stop-verify check RECEIPT --ak FILE --device ID \
-                     --pcr-ref FILE [--slot A|B] (--nonce HEX | --no-nonce)";
+                     --pcr-ref FILE [--slot A|B] (--nonce HEX | --no-nonce)\n  tactiq-stop-verify interval FIRST SECOND --ak FILE \
+                     --device ID --pcr-ref FILE [--slot A|B] --nonce-first HEX --nonce-second HEX";
 
 fn nonce() -> Result<(), String> {
     use std::io::Read;
@@ -170,6 +179,66 @@ fn check(a: &[String]) -> Result<u8, String> {
     let fresh = if f.fresh { "" } else { ", not fresh" };
     println!("VERDICT     {verdict}{fresh}");
     Ok(code)
+}
+
+fn interval(a: &[String]) -> Result<u8, String> {
+    let (first, second) = match (a.first(), a.get(1)) {
+        (Some(f), Some(s)) if !f.starts_with("--") && !s.starts_with("--") => (f.as_str(), s.as_str()),
+        _ => return Err(USAGE.into()),
+    };
+    let (mut ak, mut device, mut pcr_ref, mut slot, mut n1, mut n2) = (None, None, None, None, None, None);
+    let mut i = 2;
+    while i < a.len() {
+        let val = a.get(i + 1).map(String::as_str).ok_or_else(|| format!("{} needs a value", a[i]))?;
+        match a[i].as_str() {
+            "--ak" => ak = Some(val),
+            "--device" => device = Some(val),
+            "--pcr-ref" => pcr_ref = Some(val),
+            "--slot" => slot = Some(val),
+            "--nonce-first" => n1 = Some(unhex(val)?),
+            "--nonce-second" => n2 = Some(unhex(val)?),
+            other => return Err(format!("unknown option {other}\n{USAGE}")),
+        }
+        i += 2;
+    }
+    let (n1, n2) = (n1.ok_or("--nonce-first is required")?, n2.ok_or("--nonce-second is required")?);
+    for (n, name) in [(&n1, "--nonce-first"), (&n2, "--nonce-second")] {
+        if n.len() < NONCE_MIN || n.len() > NONCE_MAX {
+            return Err(format!("{name}: {} bytes, must be {NONCE_MIN}..={NONCE_MAX}", n.len()));
+        }
+    }
+    let (ak_path, pcr_path) = (ak.ok_or("--ak is required")?, pcr_ref.ok_or("--pcr-ref is required")?);
+    let device = device.ok_or("--device is required")?;
+    let r1 = fs::read(first).map_err(|e| format!("read {first}: {e}"))?;
+    let r2 = fs::read(second).map_err(|e| format!("read {second}: {e}"))?;
+    let ak_bytes = fs::read(ak_path).map_err(|e| format!("read {ak_path}: {e}"))?;
+    let ak = AkKey::from_tpm2b_public(&ak_bytes).map_err(|e| format!("{ak_path}: {e}"))?;
+    let ref_text = fs::read_to_string(pcr_path).map_err(|e| format!("read {pcr_path}: {e}"))?;
+    let (composite, ref_note) = reference_composite(&ref_text, slot)?;
+    let t = StopTrust {
+        ak: &ak,
+        device_id: device_id(device)?,
+        pcr_selection: encode_pcr_selection(SHA256, BITMAP),
+        pcr_composite: composite,
+        nonce: None,
+    };
+    let v = verify_stop_interval(&r1, &n1, &r2, &n2, &t)?;
+
+    println!("first       {first}: answers nonce {}", hex(&n1));
+    println!("second      {second}: answers nonce {}", hex(&n2));
+    println!("device      {device}");
+    println!("ak          name {}", hex(ak.name()));
+    println!("build       PCR 0, 1, 8 equal to {pcr_path}{ref_note}, at both ends");
+    println!("counter     {} (odd) at both ends, read and signed by the TPM", v.stop_epoch);
+    println!(
+        "tpm boot    resetCount {}, restartCount {} at both ends: no reboot and no resume in between",
+        v.from.reset_count, v.from.restart_count
+    );
+    println!("tpm clock   {} to {} ms, {} ms apart (TPM time, not wall time)", v.from.clock, v.to.clock, v.held_ms());
+    println!("basis       the counter never moved and the TPM did not reboot; in the build named above every call is refused at an odd counter");
+    println!("not shown   that no command reached a process: that is an observation of the process, not of this device");
+    println!("VERDICT     HELD");
+    Ok(0)
 }
 
 /// SHA-256 over the reference values of PCR 0, 1 and 8, in that order: what

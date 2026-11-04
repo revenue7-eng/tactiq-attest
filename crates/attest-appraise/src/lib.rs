@@ -28,7 +28,7 @@ pub use gate1::{
 };
 pub use reference::{AttestedState, PcrHash, PcrSelection, ReferenceSet};
 pub use rim::reference_from_rim;
-pub use stop::{verify_stop_receipt, StopBasis, StopFinding, StopTrust};
+pub use stop::{verify_stop_interval, verify_stop_receipt, StopBasis, StopFinding, StopInterval, StopTrust};
 pub use verdict::{Outcome, Reason, Verdict};
 
 #[cfg(test)]

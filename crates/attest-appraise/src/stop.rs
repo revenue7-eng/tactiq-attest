@@ -34,8 +34,8 @@ use attest_envelope::tpm::Quote;
 use attest_envelope::{evidence_digest, parse_bundle, AttestationMessage, DEVICE_ID_LEN, PCR_SELECTION_LEN};
 use attest_envelope::{TAG_STOP_STATE, TAG_TPM_NV_CERTIFY, TAG_VERIFIER_NONCE};
 use attest_stop::{
-    certify_qualifying, check_counter_certify, check_nonce, stop_index_name, stop_quote_qualifying, Kind,
-    NvCertify, Receipt, State, StopRecord,
+    certify_qualifying, check_counter_certify, check_nonce, parse_nv_certify_info, stop_index_name,
+    stop_quote_qualifying, Kind, NvCertify, Receipt, State, StopRecord, TpmClock,
 };
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 
@@ -70,6 +70,10 @@ pub struct StopFinding {
     pub policy_digest: [u8; 32],
     /// Bound to the verifier's nonce.
     pub fresh: bool,
+    /// When the TPM read the stop counter, by its own clock (the certify's
+    /// `clockInfo`). The quote of the same receipt was made in the same TPM
+    /// boot: the check refuses a receipt whose two signatures come from two.
+    pub clock: TpmClock,
 }
 
 /// Who says the agent is stopped, if anyone.
@@ -120,7 +124,10 @@ fn verify(vk: &VerifyingKey, signed: &[u8], sig: &[u8], what: &str) -> Result<()
 /// 9. nonce: present and equal when the verifier sent one, absent when not;
 ///    a nonce-bound receipt must be a status answer;
 /// 10. an odd counter reported as running is refused: the service cannot
-///     produce it.
+///     produce it;
+/// 11. the certify and the quote were made in one TPM boot (equal
+///     `resetCount` and `restartCount`), so the counter that was read and
+///     the build that was quoted are of the same boot.
 pub fn verify_stop_receipt(receipt: &[u8], t: &StopTrust) -> Result<StopFinding, String> {
     let r = Receipt::parse(receipt)?;
     let msg = AttestationMessage::parse(&r.msg)?;
@@ -200,6 +207,16 @@ pub fn verify_stop_receipt(receipt: &[u8], t: &StopTrust) -> Result<StopFinding,
     if record.stop_epoch % 2 == 1 && record.state == State::Running {
         return Err("stop record: odd counter reported as running".into());
     }
+    let clock = parse_nv_certify_info(&c.attest)?.clock;
+    let qc = &q.clock_info;
+    let quoted = TpmClock { clock: qc.clock, reset_count: qc.reset_count, restart_count: qc.restart_count, safe: qc.safe };
+    if !clock.same_boot(&quoted) {
+        return Err(format!(
+            "receipt: the counter was read in one TPM boot (reset {}, restart {}) and the build quoted in another \
+             (reset {}, restart {})",
+            clock.reset_count, clock.restart_count, quoted.reset_count, quoted.restart_count
+        ));
+    }
 
     Ok(StopFinding {
         kind: record.kind,
@@ -207,5 +224,103 @@ pub fn verify_stop_receipt(receipt: &[u8], t: &StopTrust) -> Result<StopFinding,
         stop_epoch: record.stop_epoch,
         policy_digest: record.policy_digest,
         fresh: !nonce_bytes.is_empty(),
+        clock,
     })
+}
+
+/// A stop that held between two receipts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StopInterval {
+    /// The odd stop counter, equal at both ends.
+    pub stop_epoch: u64,
+    /// The TPM's clock when it read the counter, at each end.
+    pub from: TpmClock,
+    pub to: TpmClock,
+}
+
+impl StopInterval {
+    /// Milliseconds of TPM clock between the two reads.
+    pub fn held_ms(&self) -> u64 {
+        self.to.clock - self.from.clock
+    }
+}
+
+/// Check that the stop held from one receipt to a later one, with nothing
+/// from the device but the two receipts and the AK.
+///
+/// Each receipt must pass [`verify_stop_receipt`] against the same AK, device
+/// and reference build, each with its own nonce (`t.nonce` must be `None`;
+/// the nonces are given here). Then:
+///
+/// 1. the two nonces differ;
+/// 2. both counters are odd: a stop the TPM itself states. An even counter
+///    with no release is the service's word and is refused here;
+/// 3. the counter is the same at both ends. The TPM only ever increments it,
+///    and both a lift and a new trip increment it, so an equal value means
+///    neither happened in between. A counter deleted and defined again
+///    starts above every value the chip has held, so it cannot come back to
+///    this one;
+/// 4. the same TPM boot at both ends: equal `resetCount` (no reboot) and
+///    equal `restartCount` (no resume). Within one boot PCRs only move
+///    forward by extend, so both quotes equal to the reference means the
+///    reference build ran the whole time;
+/// 5. the second read is later by the TPM clock.
+///
+/// Not established: anything about wall time (the TPM clock counts while
+/// powered and can be moved forward by its owner or platform, so
+/// [`StopInterval::held_ms`] can be more than the time that passed, never
+/// less within one boot); and that no command reached a process while the
+/// gateway refused: that needs an observation of the process itself.
+pub fn verify_stop_interval(
+    first: &[u8],
+    first_nonce: &[u8],
+    second: &[u8],
+    second_nonce: &[u8],
+    t: &StopTrust,
+) -> Result<StopInterval, String> {
+    if t.nonce.is_some() {
+        return Err("interval: give the nonces to verify_stop_interval, not in the trust".into());
+    }
+    if first_nonce == second_nonce {
+        return Err("interval: both receipts answer the same challenge".into());
+    }
+    let at = |r: &[u8], n: &[u8], which: &str| {
+        let tn = StopTrust { nonce: Some(n), ..*t };
+        verify_stop_receipt(r, &tn).map_err(|e| format!("{which} receipt: {e}"))
+    };
+    let a = at(first, first_nonce, "first")?;
+    let b = at(second, second_nonce, "second")?;
+    for (f, which) in [(&a, "first"), (&b, "second")] {
+        if f.basis() != StopBasis::Counter {
+            return Err(format!(
+                "interval: the {which} receipt is not a stop the TPM states (counter {} is even)",
+                f.stop_epoch
+            ));
+        }
+    }
+    if a.stop_epoch != b.stop_epoch {
+        return Err(format!(
+            "interval: the stop counter moved from {} to {}: the stop was lifted or tripped again in between",
+            a.stop_epoch, b.stop_epoch
+        ));
+    }
+    if a.clock.reset_count != b.clock.reset_count {
+        return Err(format!(
+            "interval: the TPM was reset in between (resetCount {} then {}): a reboot, after which any build may have run",
+            a.clock.reset_count, b.clock.reset_count
+        ));
+    }
+    if a.clock.restart_count != b.clock.restart_count {
+        return Err(format!(
+            "interval: the TPM was restarted in between (restartCount {} then {})",
+            a.clock.restart_count, b.clock.restart_count
+        ));
+    }
+    if b.clock.clock <= a.clock.clock {
+        return Err(format!(
+            "interval: the second receipt is not later by the TPM clock ({} then {} ms)",
+            a.clock.clock, b.clock.clock
+        ));
+    }
+    Ok(StopInterval { stop_epoch: a.stop_epoch, from: a.clock, to: b.clock })
 }

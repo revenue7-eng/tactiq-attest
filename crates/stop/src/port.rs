@@ -218,6 +218,7 @@ pub mod fake {
             let a = build_nv_certify_info_for_tests(&NvCertifyInfo {
                 qualified_signer: vec![0x00, 0x0b, 0xAA],
                 extra_data: qualifying.to_vec(),
+                clock: attest_stop::TpmClock { clock: 1000, reset_count: 1, restart_count: 0, safe: true },
                 index_name,
                 offset: 0,
                 contents: self.counter.get().to_be_bytes().to_vec(),
