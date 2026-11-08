@@ -35,3 +35,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --manifest-path tools/stop-verify/Cargo.toml
+  # Tags-block code points, bidirectional controls and zero-width characters
+  # change what a reader (human or model) takes a file to say without changing
+  # what is shown. Same check as tactiq-os; the script there is the original.
+  invisible-chars:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -I tests/invisible/test_check_invisible_chars.py
+      - run: python3 -I scripts/check-invisible-chars.py
