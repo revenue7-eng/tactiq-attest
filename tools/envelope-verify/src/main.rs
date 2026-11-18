@@ -15,15 +15,21 @@
 //!                    (`tactiq-pcr-reference/1` or `/2`, mk-pcr-reference.py);
 //!                    `--slot` when PCR 1 differs per slot. The PCRs it lists
 //!                    are the selection the envelope must have quoted.
+//!   --highest-accepted N
+//!                    optional: the highest counter you have already accepted
+//!                    from this device. An envelope whose signed counter is not
+//!                    above it is refused as Stale. The tool keeps nothing: the
+//!                    number is yours to keep between runs.
 //!
 //! The check is `attest_appraise::authenticate_envelope` and
 //! `attest_appraise::appraise`, stateless. It answers: was this envelope
 //! signed through a TPM quote by this device's AK, does the quote commit to
 //! this message, is the bundle the one that was signed over, and was the
-//! measured state the reference's at the moment of signing. It does not
-//! answer whether this is the device's latest envelope: that needs the
-//! highest counter already accepted from the device, which a stateless check
-//! does not have.
+//! measured state the reference's at the moment of signing. Whether this is
+//! the device's latest envelope needs the highest counter already accepted
+//! from the device. The tool does not keep it; given `--highest-accepted`, it
+//! applies it, in the verifier's order: authenticity, then freshness, then
+//! state.
 //!
 //! Exit status: 0 accepted, 1 refused.
 
@@ -38,7 +44,7 @@ use sha2::{Digest, Sha256};
 const SHA256: u16 = 0x000B;
 
 const USAGE: &str =
-    "usage:\n  tactiq-envelope-verify check STEM --ak FILE --device ID --pcr-ref FILE [--slot A|B]";
+    "usage:\n  tactiq-envelope-verify check STEM --ak FILE --device ID --pcr-ref FILE [--slot A|B] [--highest-accepted N]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -62,11 +68,12 @@ struct Opts<'a> {
     device: &'a str,
     pcr_ref: &'a str,
     slot: Option<&'a str>,
+    highest: Option<u64>,
 }
 
 fn opts(a: &[String]) -> Result<Opts<'_>, String> {
     let stem = a.first().filter(|s| !s.starts_with("--")).ok_or(USAGE)?;
-    let (mut ak, mut device, mut pcr_ref, mut slot) = (None, None, None, None);
+    let (mut ak, mut device, mut pcr_ref, mut slot, mut highest) = (None, None, None, None, None);
     let mut i = 1;
     while i < a.len() {
         let val = a.get(i + 1).map(String::as_str).ok_or_else(|| format!("{} needs a value", a[i]))?;
@@ -75,6 +82,9 @@ fn opts(a: &[String]) -> Result<Opts<'_>, String> {
             "--device" => device = Some(val),
             "--pcr-ref" => pcr_ref = Some(val),
             "--slot" => slot = Some(val),
+            "--highest-accepted" => {
+                highest = Some(val.parse::<u64>().map_err(|_| format!("--highest-accepted {val:?}: not a counter"))?)
+            }
             other => return Err(format!("unknown option {other}\n{USAGE}")),
         }
         i += 2;
@@ -85,6 +95,7 @@ fn opts(a: &[String]) -> Result<Opts<'_>, String> {
         device: device.ok_or("--device is required")?,
         pcr_ref: pcr_ref.ok_or("--pcr-ref is required")?,
         slot,
+        highest,
     })
 }
 
@@ -125,12 +136,23 @@ fn check(a: &[String]) -> Result<u8, String> {
         _ => "not a TPM quote",
     };
     println!("signed      {binding}; bundle bound to the signed evidence_hash");
-    println!("counter     {} (as signed; whether it is the newest is not checked here)", auth.counter());
+    match o.highest {
+        None => println!("counter     {} (as signed; not compared: no --highest-accepted given)", auth.counter()),
+        Some(h) if auth.counter() <= h => {
+            println!("counter     {} is not above the highest you accepted, {h}", auth.counter());
+            println!("VERDICT     REJECT {:?}", attest_appraise::Reason::Stale);
+            return Ok(1);
+        }
+        Some(h) => println!("counter     {} is above the highest you accepted, {h}", auth.counter()),
+    }
 
     let refs = ReferenceSet::new(PcrSelection::from_canonical(&selection), vec![composite]);
     let v = appraise(&auth, &refs);
     println!("build       PCR {pcrs} against {}{ref_note}", o.pcr_ref);
-    println!("not shown   that this is the device's latest envelope: that needs the highest counter already accepted from it");
+    match o.highest {
+        None => println!("not shown   that this is the device's latest envelope: that needs the highest counter already accepted from it"),
+        Some(_) => println!("freshness   judged against the counter you gave; keeping it honestly between runs is up to you"),
+    }
     if v.is_accept() {
         println!("VERDICT     ACCEPT");
         Ok(0)
