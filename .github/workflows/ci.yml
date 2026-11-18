@@ -35,6 +35,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --manifest-path tools/stop-verify/Cargo.toml
+  # The single-envelope verifier is its own workspace too.
+  envelope-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --manifest-path tools/envelope-verify/Cargo.toml
   # Tags-block code points, bidirectional controls and zero-width characters
   # change what a reader (human or model) takes a file to say without changing
   # what is shown. Same check as tactiq-os; the script there is the original.
