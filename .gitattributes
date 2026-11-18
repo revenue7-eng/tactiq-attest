@@ -20,3 +20,11 @@ crates/attest-appraise/tests/fixtures/stop/*.tqsr binary
 crates/attest-appraise/tests/fixtures/stop/*.pub binary
 # The stop sample: a TPM-signed receipt over exact bytes.
 docs/stop-sample/*.tqsr binary
+# The envelope sample: TPM quotes, signatures and the AK over exact bytes, and
+# a reference and sums that SHA256SUMS covers. An autocrlf checkout would
+# rewrite the files that contain 0x0a and break both the signatures and the sums.
+docs/envelope-sample/envelopes/** binary
+docs/envelope-sample/tampered/** binary
+docs/envelope-sample/*.pub binary
+docs/envelope-sample/*.json -text
+docs/envelope-sample/SHA256SUMS -text
