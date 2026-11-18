@@ -1,0 +1,24 @@
+[package]
+name = "envelope-verify"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Checks one attestation envelope of tactiq-agent away from the device"
+publish = false
+
+# A workspace of its own, like stop-verify and the registrar: it runs on the
+# operator's or auditor's machine, never on a device, and the agent recipe in
+# tactiq-os vendors every crate of the root lock file.
+[workspace]
+
+[[bin]]
+name = "tactiq-envelope-verify"
+path = "src/main.rs"
+
+[dependencies]
+# The check itself is attest-appraise's, the same code a browser or a verifier
+# appliance runs; this tool only reads files and prints.
+attest-appraise = { path = "../../crates/attest-appraise" }
+attest-envelope = { path = "../../crates/attest-envelope" }
+serde_json = "1"
+sha2 = "0.10"

@@ -30,10 +30,12 @@ a minimum.
 |---|---|
 | `attest-envelope` | The wire format: the signed message, and the tag/len container for the evidence bundle it commits to. Parse, build, encode the PCR selection. No state, no I/O, no trust decision. |
 | `attest-stop` | Formats of the stop service: the stop record (tag `0x0004`), the verifier nonce (`0x0005`), the NV certify section (`0x0006`) with a parser for the TPM's `TPM_ST_ATTEST_NV` structure, and the receipt container. Parse, build and check, exact lengths, no state. |
+| `attest-appraise` | The check of one envelope (DDR-003, decision 7): the signature through the TPM quote under the device's AK, the binding of quote, message and bundle, and the measured state against a reference. Stateless: no clock, no filesystem, no network; builds for `wasm32-unknown-unknown`. It does not say whether an envelope is the device's latest. Also the check of a stop receipt. |
 | `attest-tpm` | Every TPM call the device binaries make, in one crate. Shells out to `tpm2-tools` today. |
 | `prover` | `tactiq-agent`: provisions an identity, then produces one signed envelope per cycle. |
 | `stop` | `tactiq-stop`: the agent stop service. Answers agentgateway's `extAuthz` before every tool call; the stop state is the parity of a TPM NV counter, and every refusal carries a receipt with the AK quote over the boot PCRs and the TPM's own `NV_Certify` of that counter, checked on the device before it is handed out. A stop is lifted only by the operator's release, a record naming the device and the next epoch, signed with the operator's key (ECDSA P-256, `openssl dgst -sha256 -sign`), whose public half is on the device's dm-verity root; stopping needs nothing. Not yet closed: the AK is shared with the agent, and a release image has no operator channel. See the service's own documentation. |
 | `tools/stop-verify` | `tactiq-stop-verify`: the check of a stop receipt away from the device, offline. `nonce` draws a challenge; `check` verifies a receipt from `tactiq-stop status <nonce>` (or a 403 body) under the device's registered AK, against the PCR reference of the accepted build: both TPM signatures, the binding of quote, record, certify and nonce, the stop counter's name computed from its definition. It says whether the agent is stopped and on whose word: an odd counter is the TPM's, an even one is the stop service's finding on the operator's release. The check is `attest_appraise::verify_stop_receipt`, stateless; the tool reads files and prints. Its own workspace, like the registrar. |
+| `tools/envelope-verify` | `tactiq-envelope-verify`: the check of one envelope away from the device, offline. `check STEM` verifies `STEM.msg`, `.attest`, `.sig` and the bundle `.tag` under the device's registered AK, against the PCR reference of the accepted build. It prints ACCEPT or the reason for refusal. Whether the envelope is the device's latest is not checked: that needs the highest counter already accepted from the device. The check is `attest_appraise`, stateless; the tool reads files and prints. Its own workspace, like the registrar. |
 
 ## The evidence bundle
 
@@ -66,17 +68,20 @@ canonicalisation, so section order is part of what is signed.
 
 ## What is not here
 
-The verifier. Signature checking, the anti-replay high-water mark, the durable
-write, the reference-value appraisal and the trust store are a separate,
-closed component that runs in the Custinel appliance. Which tags a verifier
-requires, and how a tag maps to an evidence kind, are its decisions, not the
-codec's.
+The state a verifier keeps over time. The anti-replay high-water mark, the
+durable write, the registry of devices and the provenance of reference values
+are a separate, closed component that runs in the Custinel verifier
+([custinel.com](https://custinel.com)). The check of one envelope is here, in
+`attest-appraise` and `tools/envelope-verify` (DDR-003, decision 7), so anyone
+can verify an envelope without trusting us; whether it is the device's latest
+envelope is the closed part's question. Which tags a verifier requires, and
+how a tag maps to an evidence kind, are its decisions, not the codec's.
 
 That split is deliberate. The envelope has to exist on both sides, and the
 agent ships on every device, so the format is recoverable from a binary or from
 the wire no matter what this repository says. Keeping it closed would buy
 nothing and cost the ability to audit what runs on your own hardware. The
-verifier never leaves the appliance, so it stays where it is.
+state the verifier keeps never leaves its device, so it stays where it is.
 
 ## Design notes worth reading before changing anything
 
