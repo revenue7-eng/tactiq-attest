@@ -1,0 +1,100 @@
+{
+  "assumptions": [
+    "U-Boot runs boot_ab from the default environment compiled into u-boot.itb (bootcmd is run boot_ab); only the variables under components.env_writable are imported from storage (CONFIG_ENV_WRITEABLE_LIST), checked to exclude bootargs, bootcmd, boot_ab and preboot",
+    "the values hold only while the loader itself is the one built: SPL is neither measured nor verified by the boot ROM until the SoC OTP key is fused, and a replaced SPL can extend these same values",
+    "bootargs is empty at bootm; a PCR 1 other than the one given means a command line outside the signed configuration reached U-Boot",
+    "the kernel command line, including the dm-verity root hash, is in /chosen of each configuration's devicetree and is covered by the devicetree digest in PCR 1",
+    "the boot partition of each slot carries the fitImage named under inputs",
+    "no initrd is loaded",
+    "SPL measures the images of u-boot.itb and is itself unmeasured: it is the root of the measurement chain"
+  ],
+  "bank": "sha256",
+  "boot_path": "bootm",
+  "components": {
+    "boot_ab_sha256": "60e21eea0c5d08f4032143eef76d8fb7baafd04350be9cfb1e40f41c55f40091",
+    "bootargs": "",
+    "env_flags_list": "serial#:so,BOOT_ORDER:sw,BOOT_A_LEFT:dw,BOOT_B_LEFT:dw,fit_seen_A:sw,fit_seen_B:sw",
+    "env_writable": [
+      "BOOT_A_LEFT",
+      "BOOT_B_LEFT",
+      "BOOT_ORDER",
+      "fit_seen_A",
+      "fit_seen_B"
+    ],
+    "fit_configurations": [
+      "conf-rk3588s-rock-5a-b.dtb",
+      "conf-rk3588s-rock-5a.dtb"
+    ],
+    "fit_default_configuration": "conf-rk3588s-rock-5a.dtb",
+    "fit_key_name_hint": [
+      "dev-fit"
+    ],
+    "kernel_devicetree_pcr": 1,
+    "slots": {
+      "A": {
+        "cmdline": "dm-mod.create=\"rootfs,,,ro,0 1182848 verity 1 /dev/mmcblk0p2 /dev/mmcblk0p2 4096 4096 147856 147856 sha256 a11d2132b91462deb7fe6468c7d9de793a0a58b6770f3eb78bbede22f0163631 8a7b98d830ac3bf9daa968b9c322bc1e6d9300c632f8f610be59dd67d2c4d797 1 ignore_zero_blocks\" root=/dev/dm-0 ro rootwait rootfstype=ext4 earlycon panic=5 console=tty1 console=ttyS2,1500000n8 systemd.machine_id=firmware lockdown=confidentiality module.sig_enforce=1 sysctl.kernel.io_uring_disabled=2 rauc.slot=A",
+        "fdt_sha256": "9aa39c486a85687a043d2be0f5a2f618a4a4c8626ed0915a9552162f7aaf19a2",
+        "fit_configuration": "conf-rk3588s-rock-5a.dtb",
+        "kernel_load": "0x08000000",
+        "kernel_sha256": "fcc99f9a778716689597ef493728399923761407e1de24e740c57302c19bdef3"
+      },
+      "B": {
+        "cmdline": "dm-mod.create=\"rootfs,,,ro,0 1182848 verity 1 /dev/mmcblk0p4 /dev/mmcblk0p4 4096 4096 147856 147856 sha256 a11d2132b91462deb7fe6468c7d9de793a0a58b6770f3eb78bbede22f0163631 8a7b98d830ac3bf9daa968b9c322bc1e6d9300c632f8f610be59dd67d2c4d797 1 ignore_zero_blocks\" root=/dev/dm-0 ro rootwait rootfstype=ext4 earlycon panic=5 console=tty1 console=ttyS2,1500000n8 systemd.machine_id=firmware lockdown=confidentiality module.sig_enforce=1 sysctl.kernel.io_uring_disabled=2 rauc.slot=B",
+        "fdt_sha256": "0cd6246d800acd57cc27091051850b652066dc70edf2a58e0066512fe8c5af78",
+        "fit_configuration": "conf-rk3588s-rock-5a-b.dtb",
+        "kernel_load": "0x08000000",
+        "kernel_sha256": "fcc99f9a778716689597ef493728399923761407e1de24e740c57302c19bdef3"
+      }
+    },
+    "spl_configuration": "config-1",
+    "spl_measurements": [
+      {
+        "image": "atf-1",
+        "pcr": 0,
+        "sha256": "6a4a192c104cc98c4b7e63ad0c6728b27b1af0a95fb9555b19faf55f8cf5871c"
+      },
+      {
+        "image": "u-boot",
+        "pcr": 4,
+        "sha256": "da3c3d430768f5ca01c7ad3e00f6a686ac48a386ccf86e6495ac9cbac6e6104a"
+      },
+      {
+        "image": "fdt-1",
+        "pcr": 6,
+        "sha256": "f42ed422d1e180cfc04464df2ff3088264871808458ddc782a5d976625635a7f"
+      },
+      {
+        "image": "atf-2",
+        "pcr": 0,
+        "sha256": "569ee96047e8ff069a6f89d1f62a530133c3e0afc74da4958519da2b51ec57d6"
+      },
+      {
+        "image": "atf-3",
+        "pcr": 0,
+        "sha256": "70505bb764db81a665c8bba4953d804ed9eab580d5428888a4436121eff11c50"
+      }
+    ],
+    "uboot_version": "U-Boot 2026.10 (Oct 05 2026 - 21:35:33 +0000)"
+  },
+  "format": "tactiq-pcr-reference/2",
+  "inputs": {
+    "fitImage": "4e3881a4cee797ecd5694c437a12dfbf34daebfe8d7661198f7c4798ddfcb0fe",
+    "u-boot.itb": "f7e0a56d40b8ab9c607ff81b2c34461fbd267dda03c068c4c4155653c709b08e"
+  },
+  "pcr": {
+    "0": "9BD4AB6216B55C5BBE172F31737ED87C8A585FAA3B45C4CAF225B0778AC3AAFE",
+    "1": {
+      "A": "DCA32CE93FE6F90DBBA13C9007353EBF074DAB1D83A743FB9C8C776DA0B63E59",
+      "B": "AA6741426D0CA6BF5FA3E58A02A9B0011A531B958A4BB7A390744D412B0CC5B1"
+    },
+    "2": "E21B703EE69C77476BCCB43EC0336A9A1B2914B378944F7B00A10214CA8FEA93",
+    "3": "E21B703EE69C77476BCCB43EC0336A9A1B2914B378944F7B00A10214CA8FEA93",
+    "4": "70D266D6BD707CDDCC1CB9FE002F6792E2394DA2731A6A3C6672B1133B791EC4",
+    "5": "E21B703EE69C77476BCCB43EC0336A9A1B2914B378944F7B00A10214CA8FEA93",
+    "6": "B8D6C3885B7AC27AE97F88F5063EB5016C3BFC82CB561DE8214B5483256CB5DD",
+    "7": "E21B703EE69C77476BCCB43EC0336A9A1B2914B378944F7B00A10214CA8FEA93",
+    "8": "ABCC724B2036C80FC6C7693A77CEEF4BDACC606D311849772EC4019746F3ED88",
+    "9": "CFC7D8042593E188C59D2FD523F07A95D06DD3160F0955D8C34B0EB067F517B6"
+  },
+  "recompute": "python3 mk-pcr-reference.py --fit fitImage --uboot u-boot.itb --idbloader idbloader.img"
+}
