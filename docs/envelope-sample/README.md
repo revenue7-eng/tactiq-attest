@@ -57,6 +57,24 @@ and `VERDICT     REJECT SignatureFail`.
 Both results were obtained on 18 November 2026 with the tool as merged in
 `da96af0`.
 
+## Freshness, with the counter kept by you
+
+A replayed envelope is genuine in every other respect, so a check without
+memory accepts it. Give the tool the highest counter you have already
+accepted from the device, and it refuses anything not above it as Stale. The
+counter is in the signed message; the file names here are the counters.
+
+```
+../../tools/envelope-verify/target/release/tactiq-envelope-verify check envelopes/137690611749 --ak TACTIQ-BENCH-001.ak.pub --device TACTIQ-BENCH-001 --pcr-ref TACTIQ-BENCH-001.pcr-ref.json --slot B --highest-accepted 137690611749
+```
+
+Expected: `VERDICT     REJECT Stale`. With `--highest-accepted 137690611748`
+the same envelope is accepted.
+
+The tool keeps nothing between runs; the number you pass is the memory. What
+these files cannot show is the memory of a verifier you do not run yourself:
+that it was not rolled back, and that it did not hide a newer envelope.
+
 ## What an ACCEPT here says
 
 Each envelope was signed through a TPM quote under this AK; the quote commits
@@ -65,10 +83,9 @@ PCR 0 to 9 are those the reference gives for slot B.
 
 ## What it does not say
 
-- That an envelope is the board's latest. Freshness needs the highest counter
-  already accepted from the device. That is state a verifier keeps over time,
-  and this stateless check does not have it. The counters here only increase,
-  which you can read in the file names, but the tool does not judge that.
+- That an envelope is the board's latest, unless you give the highest counter
+  you have accepted (above). Keeping that number honestly over time is state,
+  and the tool keeps none.
 - That the AK belongs to this board. The key was taken from the verifier's
   trust directory of the run, not from a signed registration record. Checked
   against itself, it proves only that the envelopes and the key go together.
