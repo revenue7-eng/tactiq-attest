@@ -81,6 +81,17 @@ PCR 0 to 9 are those the reference gives for slot B.
   the kernel, its devicetree and the dm-verity root hash in its command line;
   runtime behaviour is outside them.
 
+## What the image was built from
+
+- TactiQ OS, a development build, with its development keys.
+- `meta-everest` of the EVerest project, at tag `2026.10.0-rc2`
+  (github.com/EVerest/EVerest).
+- `meta-tactiq-everest-demo`, our layer for this bench: the station's
+  configuration and the module that sends envelopes over OCPP
+  `DataTransfer`. It is not published, so the image cannot be rebuilt from
+  public sources today. What can be repeated is the check of the envelopes
+  above, and the recomputation of the reference from its inputs.
+
 The reference records the digests of its inputs (`inputs.fitImage`,
 `inputs.u-boot.itb`) and the command that recomputes it from those files
 (`recompute`). The envelopes do not depend on this repository: the format is
