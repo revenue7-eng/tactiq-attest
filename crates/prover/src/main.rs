@@ -207,6 +207,7 @@ fn main() {
             cmd_run(&paths, &work, &out_dir, &pcr_spec, Duration::from_secs(secs), keep)
         }
         "status" => cmd_status(&paths),
+        "close-owner" => cmd_close_owner(&paths, &work),
         _ => {
             eprintln!(
                 "tactiq-agent <command>\n\
@@ -215,11 +216,16 @@ fn main() {
                    attest                  emit one signed envelope\n\
                    run                     attest on an interval (systemd)\n\
                    status                  report provisioning state\n\
+                   close-owner             persist the SRK, then set the owner and lockout\n\
+                                           authorization (provisioning, see below)\n\
                  \n\
                  env: TACTIQ_KEYS_DIR TACTIQ_OUT_DIR TACTIQ_WORK_DIR\n\
                       TACTIQ_PCR_SPEC TACTIQ_INTERVAL_SECS TACTIQ_AUDIT_KEEP\n\
                       TACTIQ_BOOT_LOG\n\
-                   TACTIQ_OWNER_AUTH_FILE TACTIQ_AK_HANDLE TACTIQ_NV_INDEX"
+                   TACTIQ_OWNER_AUTH_FILE TACTIQ_AK_HANDLE TACTIQ_NV_INDEX\n\
+                 close-owner: TACTIQ_NEW_OWNER_AUTH_FILE TACTIQ_NEW_LOCKOUT_AUTH_FILE\n\
+                      (new values), TACTIQ_OWNER_AUTH_FILE TACTIQ_LOCKOUT_AUTH_FILE\n\
+                      (values in force, to rotate them), TACTIQ_SRK_HANDLE"
             );
             std::process::exit(2);
         }
@@ -258,6 +264,132 @@ fn cmd_status(paths: &Paths) -> Result<(), String> {
             paths.keys_dir.display()
         )),
     }
+}
+
+/// Shortest authorization value `close-owner` accepts, in bytes.
+const MIN_AUTH_LEN: usize = 16;
+
+fn auth_file(var: &str) -> Result<Option<PathBuf>, String> {
+    match std::env::var(var) {
+        Err(_) => Ok(None),
+        Ok(p) => {
+            let b = fs::read(&p).map_err(|e| format!("{var}={p}: {e}"))?;
+            if b.len() < MIN_AUTH_LEN {
+                return Err(format!(
+                    "{var}={p}: {} bytes; an authorization value here is at least {MIN_AUTH_LEN} \
+                     random bytes (tpm2_getrandom -o <file> 32)",
+                    b.len()
+                ));
+            }
+            Ok(Some(PathBuf::from(p)))
+        }
+    }
+}
+
+/// Close the owner and lockout hierarchies on a provisioned device.
+///
+/// With the owner authorization empty, any process allowed to use the TPM
+/// can evict the AK, delete or redefine the counters, persist objects of its
+/// own and set the TPM clock forward. None of that forges evidence, but it can
+/// destroy the device's registered identity. This command, run once at
+/// provisioning by whoever holds the secrets:
+///   1. checks the AK, the epoch counter and the stop counter are in place,
+///      because defining any of them later takes the owner secret;
+///   2. persists a storage root key at `TACTIQ_SRK_HANDLE` (0x81000001), so
+///      keys created at run time need no owner secret;
+///   3. sets the owner, then the lockout authorization from the new files;
+///   4. checks TPM_PT_PERMANENT reports both as set, that the owner hierarchy
+///      refuses an empty authorization and accepts the new one.
+/// The endorsement hierarchy stays empty: the AK and the EK are created
+/// under it at provisioning. The secrets are read from files and never
+/// copied; removing those files from the device is the caller's step.
+fn cmd_close_owner(paths: &Paths, work: &Path) -> Result<(), String> {
+    ensure_dir(work)?;
+    if state::inspect(paths) != Provisioning::Complete {
+        return Err("not provisioned; run `provision` first, it needs the owner hierarchy".into());
+    }
+    tpm::verify_ak(&paths.pubkey(), work)?;
+    tpm::verify_counter()?;
+    if !tpm::nv_defined(tpm::STOP_NV_COUNTER)? {
+        return Err(format!(
+            "stop counter {} is not defined; run `tactiq-stop define` first: defining it \
+             after this command takes the owner secret",
+            tpm::STOP_NV_COUNTER
+        ));
+    }
+    tpm::verify_stop_counter()?;
+
+    let new_owner =
+        auth_file("TACTIQ_NEW_OWNER_AUTH_FILE")?.ok_or("TACTIQ_NEW_OWNER_AUTH_FILE is not set")?;
+    let new_lockout = auth_file("TACTIQ_NEW_LOCKOUT_AUTH_FILE")?
+        .ok_or("TACTIQ_NEW_LOCKOUT_AUTH_FILE is not set")?;
+    if fs::read(&new_owner).map_err(|e| e.to_string())?
+        == fs::read(&new_lockout).map_err(|e| e.to_string())?
+    {
+        return Err("the new owner and lockout values are the same; use two random values".into());
+    }
+    let cur_owner = auth_file("TACTIQ_OWNER_AUTH_FILE")?;
+    let cur_lockout = auth_file("TACTIQ_LOCKOUT_AUTH_FILE")?;
+
+    let before = tpm::permanent()?;
+    if before.in_lockout {
+        return Err("the TPM is in dictionary-attack lockout; wait for it to clear".into());
+    }
+    if before.owner_auth_set && cur_owner.is_none() {
+        return Err(
+            "the owner authorization is already set; to rotate it, give the value in \
+                    force in TACTIQ_OWNER_AUTH_FILE"
+                .into(),
+        );
+    }
+    if before.lockout_auth_set && cur_lockout.is_none() {
+        return Err(
+            "the lockout authorization is already set; to rotate it, give the value in \
+                    force in TACTIQ_LOCKOUT_AUTH_FILE (a wrong value locks the lockout hierarchy)"
+                .into(),
+        );
+    }
+
+    let created = tpm::ensure_srk(work)?;
+    println!(
+        "srk: {} {}",
+        tpm::srk_handle()?,
+        if created {
+            "persisted"
+        } else {
+            "already present"
+        }
+    );
+
+    tpm::change_hierarchy_auth("owner", cur_owner.as_deref(), &new_owner)?;
+    tpm::change_hierarchy_auth("lockout", cur_lockout.as_deref(), &new_lockout)?;
+
+    let after = tpm::permanent()?;
+    if !after.owner_auth_set || !after.lockout_auth_set {
+        return Err(format!("TPM_PT_PERMANENT after the change: {after:?}"));
+    }
+    if !tpm::owner_refuses_empty_auth(work)? {
+        return Err("the owner hierarchy still accepts an empty authorization".into());
+    }
+    if !tpm::owner_accepts(&new_owner, work)? {
+        return Err("the owner hierarchy does not accept the new value".into());
+    }
+    println!("owner: authorization set, empty refused, new value accepted");
+    println!("lockout: authorization set (not probed: a failed lockout authorization locks it)");
+    println!(
+        "endorsement: left {}",
+        if after.endorsement_auth_set {
+            "set"
+        } else {
+            "empty"
+        }
+    );
+    println!(
+        "remove {} and {} from this device",
+        new_owner.display(),
+        new_lockout.display()
+    );
+    Ok(())
 }
 
 fn cmd_provision(paths: &Paths, work: &Path, id: &str) -> Result<(), String> {

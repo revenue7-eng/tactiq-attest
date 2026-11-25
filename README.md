@@ -147,6 +147,35 @@ tactiq-agent attest
 End-to-end harnesses that judge the agent's output against a verifier live with
 the verifier, since they need both sides.
 
+### Closing the owner hierarchy
+
+A fresh TPM has empty owner and lockout authorizations, so any process allowed
+to use it can evict the AK, delete or redefine the counters and set the TPM
+clock forward. That forges nothing, but it can destroy the device's registered
+identity. `close-owner` is the last provisioning step, run by whoever holds the
+secrets, after `provision` and `tactiq-stop define`:
+
+```sh
+tpm2_getrandom -o /tmp/owner.auth 32
+tpm2_getrandom -o /tmp/lockout.auth 32
+TACTIQ_NEW_OWNER_AUTH_FILE=/tmp/owner.auth TACTIQ_NEW_LOCKOUT_AUTH_FILE=/tmp/lockout.auth \
+  tactiq-agent close-owner
+# copy both files off the device, then remove them from it
+```
+
+It persists a storage root key at `0x81000001` first, so keys made at run time
+need no owner secret, then sets both authorizations and checks that the owner
+hierarchy refuses an empty one. To rotate the values (a new operator), give the
+ones in force in `TACTIQ_OWNER_AUTH_FILE` and `TACTIQ_LOCKOUT_AUTH_FILE`. The
+endorsement hierarchy stays empty: the EK and the AK are created under it.
+Losing the owner value means a `TPM2_Clear`, which on TactiQ OS needs a loader
+that leaves the platform hierarchy enabled, and a new AK registration.
+
+`tests/close-owner/run.sh` runs the whole sequence on a fresh swtpm: what a
+process without the secret can no longer do, what keeps working (attest, trip,
+a key under the SRK certified by the AK), and rotation. With `--no-close` the
+same checks must fail.
+
 ## Status
 
 Alpha. Exercised against a discrete TPM (Infineon SLB9670 over SPI) as well as
