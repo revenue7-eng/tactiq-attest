@@ -194,6 +194,196 @@ pub fn nv_defined(index: &str) -> R<bool> {
     Ok(listing_has(&String::from_utf8_lossy(&o), index))
 }
 
+/// Persistent handle of the storage root key (SRK): the owner-hierarchy
+/// primary that keys created at run time are made under, at the handle the
+/// TCG provisioning guidance gives it. Persisted while the owner authorization
+/// is still known (`close-owner`), so that nothing needs it afterwards.
+pub const DEFAULT_SRK_HANDLE: &str = "0x81000001";
+
+/// Persistent handle of the SRK: `TACTIQ_SRK_HANDLE`, default
+/// `DEFAULT_SRK_HANDLE`. Must be in the owner persistent range.
+pub fn srk_handle() -> R<String> {
+    handle_from_env(
+        "TACTIQ_SRK_HANDLE",
+        DEFAULT_SRK_HANDLE,
+        0x8100_0000,
+        0x817F_FFFF,
+    )
+}
+
+const TPMA_OBJECT_FIXED_TPM: u32 = 1 << 1;
+const TPMA_OBJECT_FIXED_PARENT: u32 = 1 << 4;
+const TPMA_OBJECT_SENSITIVE_DATA_ORIGIN: u32 = 1 << 5;
+const TPMA_OBJECT_USER_WITH_AUTH: u32 = 1 << 6;
+const TPMA_OBJECT_RESTRICTED: u32 = 1 << 16;
+const TPMA_OBJECT_DECRYPT: u32 = 1 << 17;
+const TPMA_OBJECT_SIGN: u32 = 1 << 18;
+/// What an object at the SRK handle must be: a storage key that cannot leave
+/// the TPM, whose children can be created with its own (empty) auth.
+const SRK_ATTRIBUTES: u32 = TPMA_OBJECT_FIXED_TPM
+    | TPMA_OBJECT_FIXED_PARENT
+    | TPMA_OBJECT_SENSITIVE_DATA_ORIGIN
+    | TPMA_OBJECT_USER_WITH_AUTH
+    | TPMA_OBJECT_RESTRICTED
+    | TPMA_OBJECT_DECRYPT;
+
+/// objectAttributes of a `TPM2B_PUBLIC` (size, type, nameAlg, attributes).
+fn public_attributes(pub2b: &[u8]) -> R<u32> {
+    if pub2b.len() < 10 {
+        return Err(format!(
+            "TPM2B_PUBLIC of {} bytes is too short",
+            pub2b.len()
+        ));
+    }
+    Ok(u32::from_be_bytes([pub2b[6], pub2b[7], pub2b[8], pub2b[9]]))
+}
+
+/// Refuse an object at the SRK handle that is not a storage key as above.
+pub fn check_srk_attributes(attrs: u32) -> R<()> {
+    if attrs & SRK_ATTRIBUTES != SRK_ATTRIBUTES || attrs & TPMA_OBJECT_SIGN != 0 {
+        return Err(format!(
+            "the object at the SRK handle has attributes 0x{attrs:08x}; a storage root key \
+             needs fixedTPM, fixedParent, sensitiveDataOrigin, userWithAuth, restricted and \
+             decrypt, and not sign"
+        ));
+    }
+    Ok(())
+}
+
+/// Make sure a storage root key is persisted at `srk_handle()`. Returns true
+/// when this call created it. An object already there is kept only if it is
+/// a storage key (`check_srk_attributes`); it is never evicted here.
+/// Creating it takes the owner authorization, so this runs before
+/// `change_hierarchy_auth` closes the owner hierarchy.
+pub fn ensure_srk(work: &Path) -> R<bool> {
+    let h = srk_handle()?;
+    let pubf = work.join("srk.pub").to_string_lossy().to_string();
+    if handle_exists(&h)? {
+        run(&["tpm2_readpublic", "-c", &h, "-o", &pubf])?;
+        let b = std::fs::read(&pubf).map_err(|e| format!("read {pubf}: {e}"))?;
+        check_srk_attributes(public_attributes(&b)?)?;
+        return Ok(false);
+    }
+    let ctx = work.join("srk.ctx").to_string_lossy().to_string();
+    run_owner(&[
+        "tpm2_createprimary",
+        "-C",
+        "o",
+        "-g",
+        "sha256",
+        "-G",
+        "ecc256:aes128cfb",
+        "-c",
+        &ctx,
+    ])?;
+    let r = run_owner(&["tpm2_evictcontrol", "-C", "o", "-c", &ctx, &h]);
+    let _ = run(&["tpm2_flushcontext", "-t"]);
+    r?;
+    run(&["tpm2_readpublic", "-c", &h, "-o", &pubf])?;
+    let b = std::fs::read(&pubf).map_err(|e| format!("read {pubf}: {e}"))?;
+    check_srk_attributes(public_attributes(&b)?)?;
+    Ok(true)
+}
+
+/// The TPM_PT_PERMANENT flags this code reads: whether each hierarchy has an
+/// authorization value set, and whether the lockout hierarchy is locked out.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Permanent {
+    pub owner_auth_set: bool,
+    pub endorsement_auth_set: bool,
+    pub lockout_auth_set: bool,
+    pub in_lockout: bool,
+}
+
+/// Read TPM_PT_PERMANENT. Needs no authorization.
+pub fn permanent() -> R<Permanent> {
+    let o = run(&["tpm2_getcap", "properties-variable"])?;
+    parse_permanent(&String::from_utf8_lossy(&o))
+}
+
+/// Parse the TPM2_PT_PERMANENT block of `tpm2_getcap properties-variable`.
+/// Every flag must be present; a missing one is an error, not "unset".
+pub fn parse_permanent(listing: &str) -> R<Permanent> {
+    let block: Vec<&str> = listing
+        .lines()
+        .skip_while(|l| l.trim() != "TPM2_PT_PERMANENT:")
+        .skip(1)
+        .take_while(|l| l.starts_with(' ') || l.starts_with('\t'))
+        .collect();
+    let flag = |name: &str| -> R<bool> {
+        let v = block
+            .iter()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix(name)?
+                    .trim()
+                    .strip_prefix(':')
+                    .map(|v| v.trim().to_string())
+            })
+            .ok_or_else(|| format!("TPM2_PT_PERMANENT has no {name}"))?;
+        match v.as_str() {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            _ => Err(format!("TPM2_PT_PERMANENT {name}: {v}")),
+        }
+    };
+    Ok(Permanent {
+        owner_auth_set: flag("ownerAuthSet")?,
+        endorsement_auth_set: flag("endorsementAuthSet")?,
+        lockout_auth_set: flag("lockoutAuthSet")?,
+        in_lockout: flag("inLockout")?,
+    })
+}
+
+/// Set a new authorization value on the owner or lockout hierarchy, from
+/// files of raw bytes, so that no secret appears in argv. `current` is the
+/// file with the value in force, None when it is empty.
+pub fn change_hierarchy_auth(hierarchy: &str, current: Option<&Path>, new: &Path) -> R<()> {
+    if hierarchy != "owner" && hierarchy != "lockout" {
+        return Err(format!(
+            "change_hierarchy_auth: {hierarchy} is not owner or lockout"
+        ));
+    }
+    let new = format!("file:{}", new.display());
+    let cur = current.map(|p| format!("file:{}", p.display()));
+    let mut args = vec!["tpm2_changeauth", "-c", hierarchy];
+    if let Some(c) = cur.as_deref() {
+        args.push("-p");
+        args.push(c);
+    }
+    args.push(&new);
+    run(&args).map(|_| ())
+}
+
+/// Whether the owner hierarchy now refuses an empty authorization. The probe
+/// is `TPM2_CreatePrimary` with no auth: harmless if it unexpectedly works
+/// (a transient object, flushed). Owner authorization failures do not count
+/// toward dictionary-attack lockout, so the probe costs nothing. The lockout
+/// hierarchy is not probed this way: a failed lockout authorization locks it.
+pub fn owner_refuses_empty_auth(work: &Path) -> R<bool> {
+    let ctx = work.join("probe.ctx").to_string_lossy().to_string();
+    match run(&["tpm2_createprimary", "-C", "o", "-c", &ctx]) {
+        Ok(_) => {
+            let _ = run(&["tpm2_flushcontext", "-t"]);
+            Ok(false)
+        }
+        Err(e) if e.contains("0x9a2") || e.contains("0x98e") || e.contains("authorization") => {
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether the owner hierarchy accepts the value in `auth`: the same probe
+/// with that authorization.
+pub fn owner_accepts(auth: &Path, work: &Path) -> R<bool> {
+    let ctx = work.join("probe.ctx").to_string_lossy().to_string();
+    let a = format!("file:{}", auth.display());
+    let r = run(&["tpm2_createprimary", "-C", "o", "-P", &a, "-c", &ctx]);
+    let _ = run(&["tpm2_flushcontext", "-t"]);
+    Ok(r.is_ok())
+}
+
 /// Recreate the RSA-2048 EK from the default TCG template into a transient
 /// context file (DDR-005 decision 2). It is never persisted.
 ///
@@ -635,9 +825,50 @@ pub fn quote_qualified(qd: &[u8], spec: &str, attest: &Path, sig: &Path) -> R<()
 #[cfg(test)]
 mod tests {
     use super::{
-        check_counter_attributes, listing_has, parse_handle, parse_nv_attributes, parse_pcr_spec,
-        same_ak,
+        check_counter_attributes, check_srk_attributes, listing_has, parse_handle,
+        parse_nv_attributes, parse_pcr_spec, parse_permanent, public_attributes, same_ak,
+        Permanent,
     };
+
+    const PROPERTIES_VARIABLE: &str = "TPM2_PT_PERMANENT:\n  ownerAuthSet:              1\n  endorsementAuthSet:        0\n  lockoutAuthSet:            1\n  reserved1:                 0\n  disableClear:              1\n  inLockout:                 0\n  tpmGeneratedEPS:           0\n  reserved2:                 0\nTPM2_PT_STARTUP_CLEAR:\n  phEnable:                  0\n";
+
+    #[test]
+    fn permanent_flags_are_read_from_their_block() {
+        assert_eq!(
+            parse_permanent(PROPERTIES_VARIABLE).unwrap(),
+            Permanent {
+                owner_auth_set: true,
+                endorsement_auth_set: false,
+                lockout_auth_set: true,
+                in_lockout: false
+            }
+        );
+        // a flag missing from the block is an error, not "unset"
+        let no_lockout = PROPERTIES_VARIABLE.replace("  lockoutAuthSet:            1\n", "");
+        assert!(parse_permanent(&no_lockout).is_err());
+        // a flag of the same name in another block is not taken
+        let moved = "TPM2_PT_STARTUP_CLEAR:\n  ownerAuthSet: 1\n";
+        assert!(parse_permanent(moved).is_err());
+        assert!(parse_permanent(
+            &PROPERTIES_VARIABLE.replace("inLockout:                 0", "inLockout: x")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn srk_attributes() {
+        // fixedTPM|fixedParent|sensitiveDataOrigin|userWithAuth|restricted|decrypt, as
+        // tpm2_createprimary -C o -G ecc256:aes128cfb creates it (0x00030072)
+        assert!(check_srk_attributes(0x0003_0072).is_ok());
+        // a signing key, a key that can leave the TPM, an unrestricted decrypt key
+        assert!(check_srk_attributes(0x0007_0072).is_err());
+        assert!(check_srk_attributes(0x0003_0070).is_err());
+        assert!(check_srk_attributes(0x0002_0072).is_err());
+        let mut pub2b = vec![0u8, 0x5a, 0x00, 0x23, 0x00, 0x0b, 0x00, 0x03, 0x00, 0x72];
+        assert_eq!(public_attributes(&pub2b).unwrap(), 0x0003_0072);
+        pub2b.truncate(9);
+        assert!(public_attributes(&pub2b).is_err());
+    }
 
     #[test]
     fn handle_ranges() {
